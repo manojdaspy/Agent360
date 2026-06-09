@@ -19,15 +19,18 @@
   // These cover current Gemini DOM structure as of mid-2025
   const USER_MSG_SELECTORS = [
     // Gemini
-    ".user-query-bubble-with-background",
-    "user-query .query-text",
-    "user-query",
-    "[data-turn-role='user'] .query-text",
-    "[data-turn-role='user']",
+    "user-query span.user-query-bubble-with-background", // Most specific wrapper
+    "user-query .query-text",                            // Text wrapper
+    "user-query p.query-text-line",                       // The actual text paragraph
+    "user-query",                                         // Custom element fallback
     // Claude
     '[data-testid="user-message"]',
     // ChatGPT
-    '[data-message-author-role="user"]',
+    '[data-turn="user"] [data-message-author-role="user"] .user-message-bubble-color div', // Deepest text wrapper
+    '[data-message-author-role="user"] .whitespace-pre-wrap',                            // Target text directly
+    '[data-testid^="conversation-turn-"] [data-turn="user"]',                             // Turn wrapper
+    '[data-message-author-role="user"]',                                                 // Role fallback
+
     // Generic
     ".human-turn",
     ".user-message",
@@ -37,18 +40,20 @@
 
   const AI_MSG_SELECTORS = [
     // Gemini
-    "model-response .response-content",
-    "model-response .markdown",
-    "model-response",
-    "[data-turn-role='model'] .response-content",
-    "[data-turn-role='model']",
-    ".model-response-text",
+    "model-response .markdown-main-panel",                // Main response panel body
+    "model-response message-content div.markdown",        // Structural text wrapper
+    "model-response .response-content",                   // Section wrapper
+    "model-response .model-response-text",                // Component wrapper
+    "model-response",                                     // Custom element fallback
     // Claude
     '[data-testid="assistant-message"]',
     '[data-testid="assistant-message"] .whitespace-pre-wrap',
     // ChatGPT
-    '[data-message-author-role="assistant"] .markdown',
-    '[data-message-author-role="assistant"]',
+   '[data-turn="assistant"] [data-message-author-role="assistant"] .markdown',         // Main markdown engine wrapper
+   '[data-message-author-role="assistant"] .markdown-new-styling',                     // Class seen in the DOM
+   '[data-testid^="conversation-turn-"] [data-turn="assistant"]',                      // Turn wrapper
+   '[data-message-author-role="assistant"]',                                            // Role fallback
+
     // Generic
     ".assistant-turn",
     ".bot-message",
@@ -62,8 +67,9 @@
     'rich-textarea div[contenteditable="true"]',
     'div[contenteditable="true"]',
     // ChatGPT / others
-    'textarea[data-id]',
-    'textarea',
+    '#prompt-textarea[contenteditable="true"]',                                         // Specific ID wrapper
+    '.ProseMirror[role="textbox"]',                                                     // ProseMirror rich text context
+    'textarea.wcDTda_fallbackTextarea',                                                 // Fallback textarea visible in source
   ];
 
   const SEND_BTN_SELECTORS = [
@@ -72,6 +78,10 @@
     'button.send-button:not([disabled])',
     'button[data-testid="send-button"]:not([disabled])',
     'button[aria-label="Send"]:not([disabled])',
+    //Chatgpt
+    'form[data-type="unified-composer"] button[type="submit"]',                          // Standard form submission mapping
+    'form button:has(svg)',                                                             // Target icon buttons within the composer form
+
     // Generic
     'button[type="submit"]:not([disabled])',
   ];

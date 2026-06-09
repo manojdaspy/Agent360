@@ -1,0 +1,21 @@
+# VibesCode Agent — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core Django
+django>=4.2,<5.2
+djangorestframework>=3.15
+
+# HTTP client (sync + async, HTTP/2, connection pooling)
+httpx>=0.27
+
+# Environment variable management
+python-dotenv>=1.0
+
+# Git operations (for GitTool)
+gitpython>=3.1
+
+# Dev / test
+pytest>=8.0
+pytest-django>=4.8
+pytest-httpx>=0.30
+factory-boy>=3.3

@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'project_agent',
+    'rest_framework',
 ]
 
 MIDDLEWARE = [
@@ -116,3 +117,14 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+
+import os
+
+VIBESCODE = {
+    "PROJECT_ROOT": os.path.dirname(os.path.abspath(__file__)),  # auto-detects Django project root
+    # "LLM_PROVIDER": "claude",
+    # "LLM_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+    # "API_TOKEN": os.getenv("VIBESCODE_API_TOKEN"),
+    "ENABLE_SHELL": True,
+}

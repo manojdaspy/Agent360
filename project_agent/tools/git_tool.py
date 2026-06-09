@@ -1,8 +1,5 @@
 """
 project_agent/tools/git_tool.py
-Git operations: status, diff, log, blame, stash.
-Requires gitpython (pip install gitpython).
-Only reads unless ENABLE_GIT_WRITE = True.
 """
 from __future__ import annotations
 import subprocess
@@ -31,7 +28,30 @@ class GitStatusTool(BaseTool):
     def run(self, params: dict, project_root: str) -> ToolResult:
         try:
             out, err, code = _run_git(project_root, "status", "--short", "--branch")
-            return ToolResult(ok=code == 0, data=out or "(clean working tree)", error=err)
+
+            # Parse --short output into structured entries
+            entries = []
+            for line in out.splitlines():
+                if line.startswith("##"):
+                    continue        # branch line — skip for entries list
+                if len(line) >= 2:
+                    entries.append({
+                        "status": line[:2].strip(),
+                        "file":   line[3:].strip(),
+                    })
+
+            branch_line = next((l for l in out.splitlines() if l.startswith("##")), "")
+
+            return ToolResult(
+                ok=code == 0,
+                data={
+                    "branch":  branch_line.lstrip("# ").strip(),
+                    "entries": entries,
+                    "clean":   len(entries) == 0,
+                    "text":    out or "(clean working tree)",
+                },
+                error=err or None,
+            )
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 
@@ -42,7 +62,7 @@ class GitDiffTool(BaseTool):
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path, or '.' for full diff."},
+            "path":   {"type": "string",  "description": "File path, or '.' for full diff."},
             "staged": {"type": "boolean", "description": "Show staged (cached) diff instead."},
         },
         "required": [],
@@ -56,7 +76,14 @@ class GitDiffTool(BaseTool):
             if params.get("path") and params["path"] != ".":
                 args += ["--", params["path"]]
             out, err, code = _run_git(project_root, *args)
-            return ToolResult(ok=True, data=out or "(no changes)", error=err if code != 0 else "")
+            return ToolResult(
+                ok=True,
+                data={
+                    "staged": bool(params.get("staged")),
+                    "text":   out or "(no changes)",
+                },
+                error=err if code != 0 else None,
+            )
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 
@@ -67,20 +94,35 @@ class GitLogTool(BaseTool):
     input_schema = {
         "type": "object",
         "properties": {
-            "n": {"type": "integer", "description": "Number of commits (default 10)."},
-            "path": {"type": "string", "description": "Filter to commits touching this file."},
+            "n":    {"type": "integer", "description": "Number of commits (default 10, max 50)."},
+            "path": {"type": "string",  "description": "Filter to commits touching this file."},
         },
         "required": [],
     }
 
     def run(self, params: dict, project_root: str) -> ToolResult:
         try:
-            n = min(int(params.get("n", 10)), 50)
+            n    = min(int(params.get("n", 10)), 50)
             args = ["log", f"--max-count={n}", "--oneline", "--decorate"]
             if params.get("path"):
                 args += ["--", params["path"]]
             out, err, code = _run_git(project_root, *args)
-            return ToolResult(ok=code == 0, data=out or "(no commits)", error=err)
+
+            commits = []
+            for line in out.splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    commits.append({"hash": parts[0], "message": parts[1]})
+
+            return ToolResult(
+                ok=code == 0,
+                data={
+                    "commits": commits,
+                    "total":   len(commits),
+                    "text":    out or "(no commits)",
+                },
+                error=err or None,
+            )
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 
@@ -99,14 +141,18 @@ class GitBlameTool(BaseTool):
     def run(self, params: dict, project_root: str) -> ToolResult:
         try:
             out, err, code = _run_git(project_root, "blame", "--abbrev=8", params["path"])
-            return ToolResult(ok=code == 0, data=out, error=err)
+            return ToolResult(
+                ok=code == 0,
+                data={"text": out},
+                error=err or None,
+            )
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 
 
 class GitRestoreTool(BaseTool):
     name = "git_restore"
-    description = "Restore a file to its last committed state (discard working-tree changes). Only available when ENABLE_GIT_WRITE=True."
+    description = "Restore a file to its last committed state. Requires ENABLE_GIT_WRITE=True."
     input_schema = {
         "type": "object",
         "properties": {
@@ -120,6 +166,10 @@ class GitRestoreTool(BaseTool):
             return ToolResult(ok=False, error="git_restore requires ENABLE_GIT_WRITE=True in settings.")
         try:
             out, err, code = _run_git(project_root, "restore", params["path"])
-            return ToolResult(ok=code == 0, data=f"Restored: {params['path']}", error=err)
+            return ToolResult(
+                ok=code == 0,
+                data={"path": params["path"], "restored": code == 0},
+                error=err or None,
+            )
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))

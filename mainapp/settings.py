@@ -122,7 +122,8 @@ STATIC_URL = 'static/'
 import os
 
 VIBESCODE = {
-    "PROJECT_ROOT": os.path.dirname(os.path.abspath(__file__)),  # auto-detects Django project root
+    # "PROJECT_ROOT": os.path.dirname(os.path.abspath(__file__)),  # auto-detects Django project root
+    "PROJECT_ROOT": r"C:\Users\luckey\Desktop\nextgen",  # Windows-style is fine
     # "LLM_PROVIDER": "claude",
     # "LLM_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
     # "API_TOKEN": os.getenv("VIBESCODE_API_TOKEN"),

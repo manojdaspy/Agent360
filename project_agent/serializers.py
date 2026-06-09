@@ -40,11 +40,12 @@ class DirectCmdSerializer(serializers.Serializer):
     """For direct tool execution without going through the LLM."""
     op = serializers.CharField()           # tool name: dir, cat, write, search, shell …
     path = serializers.CharField(required=False, default=".")
-    content = serializers.CharField(required=False, default="")
-    pattern = serializers.CharField(required=False, default="")
     extensions = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     context_lines = serializers.IntegerField(required=False, default=2)
-    cmd = serializers.CharField(required=False, default="")
-    old_str = serializers.CharField(required=False, default="")
-    new_str = serializers.CharField(required=False, default="")
     max_depth = serializers.IntegerField(required=False, default=4)
+
+    content = serializers.CharField(required=False, default="", allow_blank=True)
+    old_str = serializers.CharField(required=False, default="", allow_blank=True)
+    new_str = serializers.CharField(required=False, default="", allow_blank=True)
+    cmd     = serializers.CharField(required=False, default="", allow_blank=True)
+    pattern = serializers.CharField(required=False, default="", allow_blank=True)

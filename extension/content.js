@@ -400,9 +400,13 @@
 
   function waitForSendButton(input, timeoutMs) {
     return new Promise((resolve) => {
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + 12000;
 
       function attempt() {
+        if (isBotGenerating()) {          // ← add this check
+          setTimeout(attempt, 500);
+          return;
+        }
         const btn = getSendButton();
         if (btn) {
           btn.click();
@@ -699,6 +703,15 @@
     }
     logContainer.scrollTop=logContainer.scrollHeight;
   }
+
+  function isBotGenerating() {
+  // Gemini shows a stop button while generating
+  return !!(
+    document.querySelector('button[aria-label="Stop response"]') ||
+    document.querySelector('.stop-button') ||
+    document.querySelector('[data-testid="stop-button"]')
+  );
+}
 
   // ── Log entry renderer ───────────────────────────────────────────
   function logToTerminal(type, title, data) {

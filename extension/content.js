@@ -150,13 +150,20 @@
 
   // Collects ALL visible message text, user + AI combined
   function getAllMessagesText() {
+    let text = "";
+    const allSels = [...USER_MSG_SELECTORS, ...AI_MSG_SELECTORS];
+    const seen    = new Set();
 
-    return [...document.querySelectorAll(
-      '[data-message-author-role]'
-    )]
-      .map(el => el.innerText?.trim() || "")
-      .filter(Boolean)
-      .join("\n");
+    for (const sel of allSels) {
+      document.querySelectorAll(sel).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const inp = getInputBox();
+        if (inp && (el === inp || el.contains(inp))) return;
+        text += (el.innerText || "") + "\n";
+      });
+    }
+    return text;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -165,50 +172,42 @@
   // ═══════════════════════════════════════════════════════════════════
   let lastSeenMessages = "";
 
-// ═══════════════════════════════════════════════════════════════════
-// 3. LIVE MESSAGE FEED (FIXED)
-// ═══════════════════════════════════════════════════════════════════
+  function scanMessages() {
+    // Try to find user + AI messages separately and log them
+    let foundAny = false;
 
+    for (const sel of USER_MSG_SELECTORS) {
+      const els = document.querySelectorAll(sel);
+      if (els.length) {
+        foundAny = true;
+        break;
+      }
+    }
 
-// function scanMessages() {
+    const allText = getAllMessagesText().trim();
+    if (!allText || allText === lastSeenMessages) return;
+    lastSeenMessages = allText;
 
-//   // SINGLE stable selector
-//   const nodes = document.querySelectorAll(
-//     '[data-message-author-role]'
-//   );
+    // Log user messages
+    for (const sel of USER_MSG_SELECTORS) {
+      document.querySelectorAll(sel).forEach(el => {
+        const t = el.innerText?.trim();
+        if (t && t.length > 2) {
+          logToTerminal("user", "👤 You", { message: t });
+        }
+      });
+    }
 
-//   nodes.forEach(node => {
-
-//     // already processed
-//     if (seenMessages.has(node)) return;
-
-//     const role = node.dataset.messageAuthorRole;
-//     const text = node.innerText?.trim();
-
-//     if (!text || text.length < 2) return;
-
-//     // skip streaming fragments
-//     const hasStreaming =
-//       node.querySelector('[class*="result-streaming"]') ||
-//       node.querySelector('.typing') ||
-//       text.endsWith("▍");
-
-//     if (hasStreaming) return;
-
-//     seenMessages.add(node);
-
-//     logToTerminal(
-//       role === "user" ? "user" : "ai",
-//       role === "user" ? "👤 You" : "🤖 AI",
-//       {
-//         message:
-//           text.length > 300
-//             ? text.slice(0, 300) + "…"
-//             : text
-//       }
-//     );
-//   });
-// }
+    // Log AI messages
+    for (const sel of AI_MSG_SELECTORS) {
+      document.querySelectorAll(sel).forEach(el => {
+        const t = el.innerText?.trim();
+        if (t && t.length > 2 && !t.includes("AGENT_CALL")) {
+          logToTerminal("ai", "🤖 AI", { message: t.slice(0, 300) + (t.length > 300 ? "…" : "") });
+        }
+      });
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // 4. DOM INSPECTOR  ← NEW
@@ -838,6 +837,9 @@
   // Scan for tool calls
   setInterval(scanForCalls, SCAN_INTERVAL);
 
+  // Scan for new messages to show in console
+  setInterval(scanMessages, 2000);
+
   // MutationObserver for real-time scanning
   setTimeout(() => {
     const root =
@@ -846,71 +848,9 @@
       document.querySelector("main") ||
       document.body;
 
-const seenMessages = new WeakSet();
-
-new MutationObserver((mutations) => {
-
-  mutations.forEach(mutation => {
-
-    mutation.addedNodes.forEach(node => {
-
-      // only element nodes
-      if (node.nodeType !== 1) return;
-
-      // direct message node
-      const msgNodes = [];
-
-      if (node.matches?.('[data-message-author-role]')) {
-        msgNodes.push(node);
-      }
-
-      node.querySelectorAll?.(
-        '[data-message-author-role]'
-      ).forEach(el => {
-        msgNodes.push(el);
-      });
-
-      if (!msgNodes.length) return;
-
-      // already handled
-      if (seenMessages.has(msgNode)) return;
-
-      const role = msgNode.dataset.messageAuthorRole;
-      const text = msgNode.innerText?.trim();
-
-      if (!text || text.length < 2) return;
-
-      // skip streaming messages
-      if (
-        text.endsWith("▍") ||
-        msgNode.querySelector('[class*="stream"]')
-      ) {
-        return;
-      }
-
-      seenMessages.add(msgNode);
-
-      logToTerminal(
-        role === "user" ? "user" : "ai",
-        role === "user" ? "👤 You" : "🤖 AI",
-        {
-          message: text
-        }
-      );
-
-    });
-
-  });
-
-  // still scan for tool calls
-  if (!callInFlight) {
-    scanForCalls();
-  }
-
-}).observe(root, {
-  childList: true,
-  subtree: true
-});
+    new MutationObserver(() => {
+      if (!callInFlight) scanForCalls();
+    }).observe(root, { childList: true, subtree: true, characterData: true });
 
     // Run inspector automatically on load so student sees what works
     setTimeout(runDOMInspector, 2000);

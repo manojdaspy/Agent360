@@ -46,7 +46,7 @@ class ChatView(APIView):
     Runs the full agentic loop synchronously and returns when done.
     For real-time streaming, use ChatStreamView instead.
     """
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def post(self, request):
         ser = ChatRequestSerializer(data=request.data)
@@ -115,7 +115,7 @@ class ChatStreamView(APIView):
       event: done          → finished
       event: error         → something failed
     """
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def get(self, request):
         message = request.query_params.get("message", "").strip()
@@ -155,7 +155,7 @@ class DirectCmdView(APIView):
     This is what an LLM uses when calling tools over raw HTTP
     (as opposed to via the structured chat endpoint or MCP).
     """
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def get(self, request):
         return self._run(request.query_params.dict())
@@ -200,7 +200,7 @@ class DirectCmdView(APIView):
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 class SessionListView(APIView):
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def get(self, request):
         sessions = AgentSession.objects.filter(is_active=True).order_by("-created_at")[:50]
@@ -215,7 +215,7 @@ class SessionListView(APIView):
 
 
 class SessionDetailView(APIView):
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def _get_or_404(self, session_id):
         try:
@@ -248,7 +248,7 @@ class SessionUndoView(APIView):
     POST /api/agent/sessions/<id>/undo/
     Restores the last file changed by the agent in this session.
     """
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def post(self, request, session_id):
         try:
@@ -284,7 +284,7 @@ class ToolDiscoveryView(APIView):
     Returns all available tools, their schemas, and all accepted op aliases.
     Useful for LLMs and clients that want to know what ops are supported.
     """
-    permission_classes = [AgentTokenPermission]
+    #permission_#classes = [AgentTokenPermission]
 
     def get(self, request):
         from .tools.registry import all_tools, llm_tool_schemas

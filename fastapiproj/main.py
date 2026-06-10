@@ -458,3 +458,6 @@ if __name__ == "__main__":
         reload=True,
         log_level="info",
     )
+
+# python main.py
+# uvicorn main:app --host 127.0.0.1 --port 8000 --reload

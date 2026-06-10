@@ -250,21 +250,34 @@
     }
 
     // ── Handshake ─────────────────────────────────────────────────────────────
-    async function _initialize() {
-      try {
-        await _send("initialize", {
-          protocolVersion: "2024-11-05",
-          capabilities:    {},
-          clientInfo:      { name: "vibescode-extension", version: "9.0.0" },
-        });
-        await _send("notifications/initialized", {});
-        _initialized = true;
-        updateStatus("✅ MCP Ready");
-        log("success", "✅ MCP initialized", { server: MCP_BASE_URL });
-      } catch (err) {
-        log("error", "❌ MCP initialize failed", { error: err.message });
-      }
-    }
+async function _initialize() {
+  try {
+
+    await _send("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: {
+        name: "vibescode-extension",
+        version: "9.0.0",
+      },
+    });
+
+    _initialized = true;
+
+    updateStatus("✅ MCP Ready");
+
+    log("success", "✅ MCP initialized", {
+      server: MCP_BASE_URL,
+    });
+
+  } catch (err) {
+
+    log("error", "❌ MCP initialize failed", {
+      error: err.message,
+    });
+
+  }
+}
 
     // ── Public API ────────────────────────────────────────────────────────────
     async function callTool(name, args = {}) {

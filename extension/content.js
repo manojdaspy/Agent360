@@ -23,8 +23,8 @@
   //   → /sse, /messages, /push/stream are at the root
   // When MCP is mounted inside Django at /mcp/:
   //   MCP_BASE_URL = "https://your-django-domain.com" and paths below stay correct
-  const MCP_SSE_URL   = `${MCP_BASE_URL}/sse`;           // FastMCP SSE handshake
-  const MCP_POST_URL  = `${MCP_BASE_URL}/messages`;      // FastMCP JSON-RPC POST
+  const MCP_SSE_URL   = `${MCP_BASE_URL}/mcp/sse`;           // FastMCP SSE handshake
+  const MCP_POST_URL  = `${MCP_BASE_URL}/mcp/messages`;      // FastMCP JSON-RPC POST
   const PUSH_SSE_URL  = `${MCP_BASE_URL}/push/stream`;   // Django push channel
 
   // ══════════════════════════════════════════════════════════════════════════

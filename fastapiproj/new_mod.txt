@@ -1,0 +1,77 @@
+Good to hear it’s running after reload. Your logs show the pipeline working, but they also reveal what to fix next.
+
+What your logs show
+Symptom	Cause
+20+ AGENT_CALL detected but only 1 queued
+AI dumps full history in one message; _processed skips repeats
+Calls detected at 2:41 / 2:42 / 2:44, nothing runs
+Same calls already executed at 2:38–2:40
+Prose + embedded call history after __TOOL_RESULT__
+AI breaks the one-call-per-turn rule
+Partial instead of Partial<LeaveType>
+Bad JSON in write content stripped generics
+The extension is fine. The bottleneck is AI behavior + scanner scanning entire chat history.
+
+Final prompt
+Saved as prompt13.txt. Use this as your system prompt / custom instructions.
+
+Core rules in v13:
+
+One line per turn — only AGENT_CALL {...} or a final summary
+Chain — call → wait for __TOOL_RESULT__ → next call (never replay 15 calls)
+Bootstrap once — no detect_root / project_info on every result
+Forward-slash paths — src/app/lib/hrApi.ts
+Preserve TypeScript generics in JSON strings
+Anti-patterns section — based on your exact log failures
+Architecture recommendations (scale / reliability / UX)
+1. Extension scanner (highest impact)
+Current:  all AI messages joined → scan every line → global _processed dedup
+Better:   scan ONLY the latest AI message node → one call max → per-message state
+Track lastExecutedMessageId per DOM node
+Ignore AGENT_CALL lines inside messages that already yielded a result
+Reject messages with prose + AGENT_CALL (log warning, skip all)
+2. State machine (reliability)
+IDLE → CALL_DETECTED → MCP_EXECUTING → INJECTING → WAITING_AI → IDLE
+One active trace chain: resp → mcpreq → mcpres
+Block new scans while INJECTING or MCP_EXECUTING
+Persist queue to chrome.storage.session for tab reload recovery
+3. Backend (main.py)
+Now	Scale target
+SSE one-way
+WebSocket bidirectional with heartbeat
+No idempotency
+mcpreq-* idempotency key — skip duplicate tool calls
+Single project root
+Per-session root in Redis/DB keyed by tab_id
+Sync subprocess
+Job queue (Celery/ARQ) for long shell / run_tests
+4. Panel UI (modern UX)
+Timeline view — vertical trace: input → resp → mcpreq → mcpres → inject
+Click any ID — filter logs to that chain only
+Queue panel — pending / running / done with cancel
+Virtualized log — react-window for 10k+ entries
+Status pill — LLM: generating | BTN: active | QUEUE: 3 | MCP: ✓
+5. Prompt enforcement layer
+Server-side or extension-side validator before MCP:
+
+✓ exactly one AGENT_CALL line
+✓ valid JSON
+✓ no prose on same line
+✗ reject → inject "FORMAT_ERROR: emit one AGENT_CALL only"
+6. Target stack (if rebuilding for production)
+┌─────────────┐     WebSocket      ┌──────────────┐
+│  Extension  │◄──────────────────►│  FastAPI     │
+│  (React UI) │     trace IDs       │  + Redis     │
+└─────────────┘                     │  + job queue │
+                                    └──────┬───────┘
+                                           │ MCP tools
+                                    ┌──────▼───────┐
+                                    │  Worker pool │
+                                    │  (shell/git) │
+                                    └──────────────┘
+Immediate next steps (priority order)
+Switch AI to prompt13.txt — fixes 80% of the log noise
+Scanner: latest message only — code change in content.js
+Format validator — reject prose + multi-call messages
+Panel timeline filter by trace ID — UX win from IDs you already have
+If you want, I can implement #2 and #3 in content.js next — that’s the highest-impact code change after the prompt swap.

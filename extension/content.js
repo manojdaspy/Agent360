@@ -1063,7 +1063,7 @@
         <span style="color:#f38ba8;font-size:10px;">⬤</span>
         <span style="color:#f9e2af;font-size:10px;">⬤</span>
         <span style="color:#a6e3a1;font-size:10px;">⬤</span>
-        <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">VibesCode</span>
+        <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">LuckeyVibes</span>
         <span style="font-size:9px;padding:2px 6px;border-radius:10px;background:#313244;color:#cba6f7;margin-left:4px;">${PLATFORM.name}</span>
         <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v13+</span>
       </div>

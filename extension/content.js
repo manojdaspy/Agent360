@@ -1,16 +1,13 @@
-// content.js — VibesCode Agent v10
+// content.js — VibesCode Agent v12
 // ════════════════════════════════════════════════════════════════════════════
-// Key improvements over v9:
-//   • Multi-strategy send: button click → Enter key → Ctrl+Enter → clipboard paste
-//   • Per-platform send logic with deep selector fallback chains
-//   • Mutation-aware button poller (waits for React re-render after text insert)
-//   • Input injection uses ClipboardItem API as primary path for contenteditable
-//   • Exponential backoff reconnect on SSE errors
-//   • _processed fingerprint set capped with LRU-style eviction (no memory leak)
-//   • Per-session _busy lock (keyed to session tab id) — no cross-tab collision
-//   • Push channel per-client queue registry — safe for multi-tab use
-//   • Heartbeat ACK: extension POSTs /push/ack after each injected message
-//   • Fine-grained send diagnostics logged to terminal panel
+// v12 improvements over v11:
+//   • Heartbeat now reports send_button_status (active/disabled/not_found)
+//   • Heartbeat reports input_empty, bot_typing, page_url
+//   • llm_state is now derived from all signals combined (more accurate)
+//   • Path input: user can paste any absolute path into the panel to set root
+//   • list_mcp_tools: panel shows /tools list on click
+//   • Shell input: inline shell runner in the panel (power users)
+//   • Status bar shows send button state and generating indicator live
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
   "use strict";
@@ -23,93 +20,117 @@
   const MCP_POST_URL = `${MCP_BASE_URL}/mcp/messages`;
   const PUSH_SSE_URL = `${MCP_BASE_URL}/push/stream`;
   const PUSH_ACK_URL = `${MCP_BASE_URL}/push/ack`;
+  const HEARTBEAT_URL = `${MCP_BASE_URL}/ext/heartbeat`;
 
-  // Unique ID for this tab instance (for push channel multi-client safety)
   const TAB_ID = Math.random().toString(36).slice(2, 10);
+  const HEARTBEAT_INTERVAL_MS = 2000;
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 1. PLATFORM SELECTORS  — each platform has multiple fallback send strategies
+  // 1. PLATFORM SELECTORS
   // ══════════════════════════════════════════════════════════════════════════
   const PLATFORMS = [
     {
-      name:     "ChatGPT",
-      match:    h => h.includes("chatgpt.com") || h.includes("chat.openai.com"),
-      userMsg:  '[data-message-author-role="user"] .whitespace-pre-wrap',
-      aiMsg:    '[data-message-author-role="assistant"] .markdown',
-      input:    '#prompt-textarea',
-      // Ordered fallback list — first match wins
+      name:    "ChatGPT",
+      match:   h => h.includes("chatgpt.com") || h.includes("chat.openai.com"),
+      userMsg: '[data-message-author-role="user"] .whitespace-pre-wrap',
+      aiMsg:   '[data-message-author-role="assistant"] .markdown',
+      input:   '#prompt-textarea',
       sendBtns: [
         '[data-testid="send-button"]:not([disabled])',
         'button[aria-label="Send message"]:not([disabled])',
         'button[aria-label="Send prompt"]:not([disabled])',
         'form button[type="submit"]:not([disabled])',
       ],
+      // Also check for disabled version to report status accurately
+      sendBtnAny: [
+        '[data-testid="send-button"]',
+        'button[aria-label="Send message"]',
+        'button[aria-label="Send prompt"]',
+      ],
       chatRoot: 'main',
-      // How to trigger send if all buttons fail
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
-      name:     "Claude",
-      match:    h => h.includes("claude.ai"),
-      userMsg:  '[data-testid="user-message"]',
-      aiMsg:    '[data-testid="assistant-message"] .whitespace-pre-wrap',
-      input:    'div[contenteditable="true"][data-placeholder]',
+      name:    "Claude",
+      match:   h => h.includes("claude.ai"),
+      userMsg: '[data-testid="user-message"]',
+      aiMsg:   '[data-testid="assistant-message"] .whitespace-pre-wrap',
+      input:   'div[contenteditable="true"][data-placeholder]',
       sendBtns: [
         'button[aria-label="Send message"]:not([disabled])',
         'button[aria-label="Send Message"]:not([disabled])',
         'button[type="submit"]:not([disabled])',
         '[data-testid="send-button"]:not([disabled])',
       ],
+      sendBtnAny: [
+        'button[aria-label="Send message"]',
+        'button[aria-label="Send Message"]',
+        'button[type="submit"]',
+        '[data-testid="send-button"]',
+      ],
       chatRoot: '[data-testid="conversation-turn-list"]',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
-      name:     "Gemini",
-      match:    h => h.includes("gemini.google.com"),
-      userMsg:  'user-query .query-text',
-      aiMsg:    'model-response .markdown',
-      input:    'rich-textarea div[contenteditable="true"]',
+      name:    "Gemini",
+      match:   h => h.includes("gemini.google.com"),
+      userMsg: 'user-query .query-text',
+      aiMsg:   'model-response .markdown',
+      input:   'rich-textarea div[contenteditable="true"]',
       sendBtns: [
         'button.send-button:not([disabled])',
         'button[aria-label="Send message"]:not([disabled])',
         'button[mattooltip="Send message"]:not([disabled])',
         'button[aria-label="Submit"]:not([disabled])',
         '.send-button:not([disabled])',
-        // Gemini sometimes uses a mat-icon-button inside the form
         'mat-icon-button[type="submit"]:not([disabled])',
         'button[type="submit"]:not([disabled])',
       ],
+      sendBtnAny: [
+        'button.send-button',
+        'button[aria-label="Send message"]',
+        '.send-button',
+        'button[type="submit"]',
+      ],
       chatRoot: 'chat-history',
-      // Gemini often needs Ctrl+Enter
       sendKeys: [
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: false },
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: true },
       ],
     },
     {
-      name:     "Perplexity",
-      match:    h => h.includes("perplexity.ai"),
-      userMsg:  '[data-testid="user-message"]',
-      aiMsg:    '.prose',
-      input:    'textarea',
+      name:    "Perplexity",
+      match:   h => h.includes("perplexity.ai"),
+      userMsg: '[data-testid="user-message"]',
+      aiMsg:   '.prose',
+      input:   'textarea',
       sendBtns: [
         'button[aria-label="Submit"]:not([disabled])',
         'button[type="submit"]:not([disabled])',
         'button.bg-super:not([disabled])',
       ],
+      sendBtnAny: [
+        'button[aria-label="Submit"]',
+        'button[type="submit"]',
+      ],
       chatRoot: 'main',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
-      name:     "Generic",
-      match:    () => true,
-      userMsg:  '.user-message, .human-turn, [class*="user-turn"]',
-      aiMsg:    '.assistant-message, .bot-message, [class*="assistant-turn"]',
-      input:    'div[contenteditable="true"], textarea',
+      name:    "Generic",
+      match:   () => true,
+      userMsg: '.user-message, .human-turn, [class*="user-turn"]',
+      aiMsg:   '.assistant-message, .bot-message, [class*="assistant-turn"]',
+      input:   'div[contenteditable="true"], textarea',
       sendBtns: [
         'button[aria-label="Send message"]:not([disabled])',
         'button[type="submit"]:not([disabled])',
         'button[aria-label="Submit"]:not([disabled])',
+      ],
+      sendBtnAny: [
+        'button[aria-label="Send message"]',
+        'button[type="submit"]',
+        'button[aria-label="Submit"]',
       ],
       chatRoot: 'main, body',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
@@ -117,7 +138,7 @@
   ];
 
   const PLATFORM = PLATFORMS.find(p => p.match(location.hostname));
-  console.log("[VibesCode v10] Platform:", PLATFORM.name);
+  console.log("[VibesCode v12] Platform:", PLATFORM.name);
 
   // ══════════════════════════════════════════════════════════════════════════
   // 2. DOM HELPERS
@@ -126,7 +147,6 @@
   const $$ = (sel, root = document) => { try { return [...root.querySelectorAll(sel)]; } catch { return []; } };
 
   const getInput = () => {
-    // Try platform-specific selector first, then common fallbacks
     const selectors = [
       PLATFORM.input,
       'div[contenteditable="true"][data-placeholder]',
@@ -141,19 +161,42 @@
     return null;
   };
 
-  // Try each send button selector in order; return first match
   const getSendBtn = () => {
     for (const sel of PLATFORM.sendBtns) {
       const btn = $(sel);
       if (btn && isVisible(btn) && !btn.disabled) return btn;
     }
-    // Last resort: any visible non-disabled submit button near the input
     const allBtns = $$('button:not([disabled])');
     for (const btn of allBtns) {
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || "").toLowerCase();
       if (/send|submit|go/.test(label) && isVisible(btn)) return btn;
     }
     return null;
+  };
+
+  // Check for send button in ANY state (active or disabled) for status reporting
+  const getSendBtnAny = () => {
+    const anySelectors = PLATFORM.sendBtnAny || [];
+    for (const sel of anySelectors) {
+      const btn = $(sel);
+      if (btn && isVisible(btn)) return btn;
+    }
+    // Fallback: look for disabled submit buttons
+    const allBtns = $$('button');
+    for (const btn of allBtns) {
+      const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || "").toLowerCase();
+      if (/send|submit/.test(label) && isVisible(btn)) return btn;
+    }
+    return null;
+  };
+
+  // Returns "active" | "disabled" | "not_found"
+  const getSendButtonStatus = () => {
+    const activeBtn = getSendBtn();
+    if (activeBtn) return "active";
+    const anyBtn = getSendBtnAny();
+    if (anyBtn) return "disabled";
+    return "not_found";
   };
 
   const getChatRoot = () => $(PLATFORM.chatRoot) || $('main') || document.body;
@@ -170,41 +213,49 @@
     $('[data-testid="stop-button"]') ||
     $('.stop-button') ||
     $('[aria-label="Stop"]') ||
-    // Gemini spinner
     $('loading-indicator:not([hidden])') ||
-    $('.loading-indicator-container:not([hidden])') ||
-    // ChatGPT streaming indicator
-    $('[data-testid="stop-button"]')
+    $('.loading-indicator-container:not([hidden])')
   );
 
+  const isInputEmpty = () => {
+    const input = getInput();
+    if (!input) return true;
+    const val = input.isContentEditable ? (input.innerText || "").trim() : (input.value || "").trim();
+    return val.length === 0;
+  };
+
+  // Derive a unified llm_state from all signals
+  const deriveLlmState = () => {
+    if (_busy) return "injecting";
+    if (isBotTyping()) return "generating";
+    const btnStatus = getSendButtonStatus();
+    const empty = isInputEmpty();
+    if (empty && btnStatus === "disabled") return "idle";
+    if (empty && btnStatus === "active") return "injectable";
+    if (!empty) return "idle"; // user has typed something
+    return "idle";
+  };
+
   // ══════════════════════════════════════════════════════════════════════════
-  // 3. TEXT INJECTION  — multi-strategy with deep fallback
+  // 3. TEXT INJECTION
   // ══════════════════════════════════════════════════════════════════════════
   async function injectText(input, text) {
     input.focus();
     await sleep(80);
-
-    // Strategy A: execCommand (best React/Vue compat, being deprecated but still works)
     if (tryExecCommand(input, text)) {
       log("info", "📝 Injected via execCommand", { chars: text.length });
       return true;
     }
-
-    // Strategy B: InputEvent with dataTransfer (modern replacement for execCommand)
     if (tryInputEvent(input, text)) {
       log("info", "📝 Injected via InputEvent", { chars: text.length });
       return true;
     }
-
-    // Strategy C: Clipboard paste (most reliable for stubborn editors)
     if (await tryClipboardPaste(input, text)) {
       log("info", "📝 Injected via clipboard paste", { chars: text.length });
       return true;
     }
-
-    // Strategy D: Direct value/innerText assignment (last resort, may break state)
     forceAssign(input, text);
-    log("warn", "📝 Injected via force-assign (may miss framework state)", { chars: text.length });
+    log("warn", "📝 Injected via force-assign", { chars: text.length });
     return true;
   }
 
@@ -219,17 +270,15 @@
       }
       const ok = document.execCommand("insertText", false, text);
       if (ok && getInputValue(input).length > 0) return true;
-    } catch { /* fall through */ }
+    } catch { }
     return false;
   }
 
   function tryInputEvent(input, text) {
     try {
       if (input.isContentEditable) {
-        // Clear first
         input.innerHTML = "";
         input.dispatchEvent(new Event("input", { bubbles: true }));
-        // Insert via DataTransfer
         const dt = new DataTransfer();
         dt.setData("text/plain", text);
         input.dispatchEvent(new InputEvent("input", {
@@ -238,18 +287,15 @@
           data: text,
           dataTransfer: dt,
         }));
-        // If framework didn't pick it up, set it directly on a text node
         if (!getInputValue(input)) {
           const node = document.createTextNode(text);
           input.appendChild(node);
           input.dispatchEvent(new Event("input", { bubbles: true }));
         }
       } else {
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, "value"
-        )?.set || Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, "value"
-        )?.set;
+        const nativeSetter =
+          Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set ||
+          Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
         if (nativeSetter) {
           nativeSetter.call(input, text);
           input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -262,19 +308,16 @@
 
   async function tryClipboardPaste(input, text) {
     try {
-      // Write to clipboard then paste
       await navigator.clipboard.writeText(text);
       input.focus();
       await sleep(60);
-      // Dispatch paste event
       const dt = new DataTransfer();
       dt.setData("text/plain", text);
-      const pasteOk = input.dispatchEvent(new ClipboardEvent("paste", {
+      input.dispatchEvent(new ClipboardEvent("paste", {
         bubbles: true, cancelable: true, clipboardData: dt,
       }));
       await sleep(80);
       if (getInputValue(input).length > 0) return true;
-      // If paste event not handled, try document.execCommand paste
       input.focus();
       document.execCommand("paste");
       await sleep(80);
@@ -288,7 +331,6 @@
     } else {
       input.value = text;
     }
-    // Fire all the events frameworks might listen to
     ["input", "change", "keyup", "keydown"].forEach(ev =>
       input.dispatchEvent(new Event(ev, { bubbles: true }))
     );
@@ -299,42 +341,32 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 4. SEND BUTTON — multi-strategy with mutation-aware polling
+  // 4. SEND BUTTON
   // ══════════════════════════════════════════════════════════════════════════
   async function triggerSend(input) {
-    // Poll for the button to appear — React often re-renders after text insert
     const btn = await pollForSendButton(6000);
-
     if (btn) {
-      // Strategy 1: Programmatic click
       btn.focus();
       btn.click();
       log("info", "📨 Sent via button.click()", { button: btn.getAttribute("aria-label") || btn.className });
       return true;
     }
-
     log("warn", "⚠️ Send button not found — trying keyboard fallbacks");
-
-    // Strategy 2: Platform-defined key sequences
     for (const keyOpts of (PLATFORM.sendKeys || [])) {
       dispatchKey(input, keyOpts);
       await sleep(120);
-      // Check if the input was cleared (a sign that submission worked)
       if (getInputValue(input).length === 0) {
         log("info", "📨 Sent via keyboard shortcut", { key: keyOpts.key });
         return true;
       }
     }
-
-    // Strategy 3: Enter on the input directly as a final fallback
     dispatchKey(input, { key: "Enter", code: "Enter", keyCode: 13 });
     await sleep(200);
     if (getInputValue(input).length === 0) {
       log("info", "📨 Sent via Enter fallback");
       return true;
     }
-
-    log("error", "❌ All send strategies failed — message may not have been submitted");
+    log("error", "❌ All send strategies failed");
     return false;
   }
 
@@ -352,16 +384,10 @@
     target.dispatchEvent(new KeyboardEvent("keyup", base));
   }
 
-  // Polls for the send button using a MutationObserver fallback for React re-renders
   function pollForSendButton(timeoutMs) {
     return new Promise(resolve => {
-      const deadline = Date.now() + timeoutMs;
-
-      // Check immediately
       const btn = getSendBtn();
       if (btn) return resolve(btn);
-
-      // Watch DOM mutations (React/Vue update the button state after text insert)
       let resolved = false;
       const mo = new MutationObserver(() => {
         if (resolved) return;
@@ -369,14 +395,11 @@
         if (b) { resolved = true; mo.disconnect(); clearTimeout(timer); resolve(b); }
       });
       mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "aria-disabled"] });
-
-      // Also poll at intervals in case MutationObserver misses attribute changes
       const interval = setInterval(() => {
         if (resolved) return clearInterval(interval);
         const b = getSendBtn();
         if (b) { resolved = true; mo.disconnect(); clearInterval(interval); clearTimeout(timer); resolve(b); }
       }, 120);
-
       const timer = setTimeout(() => {
         if (!resolved) { resolved = true; mo.disconnect(); clearInterval(interval); resolve(null); }
       }, timeoutMs);
@@ -384,31 +407,25 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 5. MAIN typeIntoInput — orchestrates inject + send with full retry
+  // 5. typeIntoInput
   // ══════════════════════════════════════════════════════════════════════════
   async function typeIntoInput(text, submit = true) {
-    // Wait for bot to finish generating (up to 60s)
     await waitUntil(() => !isBotTyping(), 60_000);
-    await sleep(300); // brief settle after AI finishes
-
+    await sleep(300);
     const input = getInput();
     if (!input) {
       log("error", "⚠️ No input box found", { platform: PLATFORM.name });
       return false;
     }
-
-    // Inject text with multi-strategy fallback
     await injectText(input, text);
-    await sleep(150); // let framework digest the input event
-
+    await sleep(150);
     if (!submit) return true;
-
     const sent = await triggerSend(input);
     return sent;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 6. MCP CLIENT  (JSON-RPC 2.0 over SSE)
+  // 6. MCP CLIENT
   // ══════════════════════════════════════════════════════════════════════════
   const McpClient = (() => {
     let _sessionPostUrl = null;
@@ -416,12 +433,11 @@
     let _nextId         = 1;
     let _initialized    = false;
     let _sseSource      = null;
-    let _backoffMs      = 1000;  // exponential backoff start
+    let _backoffMs      = 1000;
 
     function connect() {
       log("info", "🔌 Connecting to MCP", { url: MCP_SSE_URL });
       _sseSource = new EventSource(MCP_SSE_URL);
-
       _sseSource.addEventListener("endpoint", async (e) => {
         const raw = e.data.trim();
         _sessionPostUrl = raw.startsWith("http")
@@ -430,24 +446,21 @@
         log("info", "📡 MCP session endpoint", { url: _sessionPostUrl });
         await _initialize();
       });
-
       _sseSource.addEventListener("message", (e) => {
         let msg;
         try { msg = JSON.parse(e.data); }
-        catch { log("error", "⚠️ MCP message parse error", { raw: e.data }); return; }
+        catch { log("error", "⚠️ MCP parse error", { raw: e.data }); return; }
         _handleRpcResponse(msg);
       });
-
       _sseSource.onerror = () => {
         log("error", `❌ MCP SSE error — reconnecting in ${_backoffMs}ms`, {});
         _sseSource.close();
         _initialized = false;
         _sessionPostUrl = null;
-        updateStatus("🔴 MCP Disconnected");
+        updateMcpBadge(false);
         setTimeout(() => { _backoffMs = Math.min(_backoffMs * 2, 30_000); connect(); }, _backoffMs);
       };
-
-      _sseSource.onopen = () => { _backoffMs = 1000; }; // reset on successful connect
+      _sseSource.onopen = () => { _backoffMs = 1000; };
     }
 
     async function _send(method, params = {}) {
@@ -477,9 +490,10 @@
         await _send("initialize", {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "vibescode-extension", version: "10.0.0" },
+          clientInfo: { name: "vibescode-extension", version: "12.0.0" },
         });
         _initialized = true;
+        updateMcpBadge(true);
         updateStatus("✅ MCP Ready");
         log("success", "✅ MCP initialized", { server: MCP_BASE_URL });
       } catch (err) {
@@ -502,30 +516,64 @@
   })();
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 7. AI OUTPUT SCANNER
+  // 7. HEARTBEAT — sends rich state every 2s
+  // ══════════════════════════════════════════════════════════════════════════
+  function startHeartbeat() {
+    setInterval(async () => {
+      const llmState = deriveLlmState();
+      const btnStatus = getSendButtonStatus();
+      const empty = isInputEmpty();
+      const typing = isBotTyping();
+
+      // Update panel status bar
+      updateStatusBar(llmState, btnStatus);
+
+      try {
+        await fetch(HEARTBEAT_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tab_id:             TAB_ID,
+            platform:           PLATFORM.name,
+            llm_state:          llmState,
+            send_button_status: btnStatus,
+            input_empty:        empty,
+            bot_typing:         typing,
+            page_url:           location.href,
+            mcp_ready:          McpClient.isReady(),
+          }),
+        });
+      } catch { /* non-critical */ }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 8. AI OUTPUT SCANNER
   // ══════════════════════════════════════════════════════════════════════════
   const OP_TO_TOOL = {
     cat: "cat", read: "cat", read_file: "cat",
     tree: "tree",
-    dir: "dir", ls: "dir",
+    dir: "dir", dir_list: "dir_list", ls: "dir_list",
     search: "search", grep: "search",
     write: "write", write_file: "write",
     patch: "patch", edit: "patch",
     mkdir: "mkdir",
     delete: "delete", rm: "delete",
-    shell: "shell", run: "shell",
-    pytest: "pytest",
-    django_check: "django_check", check: "django_check",
+    shell: "shell", run: "shell", bash: "shell", exec: "shell",
+    run_tests: "run_tests", pytest: "run_tests", test: "run_tests",
+    lint: "lint", flake8: "lint", eslint: "lint",
     git_status: "git_status", status: "git_status",
     git_diff: "git_diff", diff: "git_diff",
     git_log: "git_log", log: "git_log",
-    flake8: "flake8", lint: "flake8",
+    get_root: "get_root",
+    set_root: "set_root",
+    detect_root: "detect_root",
+    project_info: "project_info",
+    list_mcp_tools: "list_mcp_tools",
   };
 
   const _seenNodes = new WeakSet();
   const _seenTexts = new Set();
-
-  // Capped LRU-style processed set to prevent memory leak on long sessions
   const _processed = (() => {
     const MAX = 500;
     const s = new Set();
@@ -539,7 +587,13 @@
   let _callCount = 0;
 
   function scanAiMessages() {
-    $$(PLATFORM.aiMsg).forEach(el => {
+    // Join ALL message nodes to fix split-node parse errors (Gemini, Claude)
+    const nodes = $$(PLATFORM.aiMsg);
+    const joined = nodes.map(el => (el.innerText || "").trim()).join("\n");
+    if (!joined) return;
+
+    // Check each node individually for new content
+    nodes.forEach(el => {
       if (_seenNodes.has(el)) return;
       const text = (el.innerText || "").trim();
       if (!text || text.length < 4) return;
@@ -547,23 +601,23 @@
       if (_seenTexts.has(fp)) return;
       _seenNodes.add(el);
       _seenTexts.add(fp);
-
       log("ai", "🤖 AI", { message: text.length > 300 ? text.slice(0, 300) + "…" : text });
-
-      for (const line of text.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("AGENT_CALL")) continue;
-        const jsonPart = trimmed.replace(/^AGENT_CALL\s*:?\s*/, "");
-        let call;
-        try { call = JSON.parse(jsonPart); }
-        catch { log("error", "⚠️ AGENT_CALL parse error", { line: trimmed }); continue; }
-        const callFp = JSON.stringify(call);
-        if (_processed.has(callFp)) continue;
-        _processed.add(callFp);
-        scheduleToolCall(call);
-        break;
-      }
     });
+
+    // Parse AGENT_CALLs from joined text (prevents split-node miss)
+    for (const line of joined.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("AGENT_CALL")) continue;
+      const jsonPart = trimmed.replace(/^AGENT_CALL\s*:?\s*/, "");
+      let call;
+      try { call = JSON.parse(jsonPart); }
+      catch { log("error", "⚠️ AGENT_CALL parse error", { line: trimmed }); continue; }
+      const callFp = JSON.stringify(call);
+      if (_processed.has(callFp)) continue;
+      _processed.add(callFp);
+      scheduleToolCall(call);
+      break; // one per scan
+    }
   }
 
   function scanUserMessages() {
@@ -613,56 +667,44 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 8. SERVER → EXTENSION PUSH CHANNEL  (per-client queue, with ACK)
+  // 9. PUSH CHANNEL
   // ══════════════════════════════════════════════════════════════════════════
   function connectPushChannel() {
-    // Include tab ID so server can target specific clients if needed
     const url = `${PUSH_SSE_URL}?tab=${TAB_ID}`;
     log("info", "📥 Connecting to push channel", { url, tab: TAB_ID });
     let backoff = 1000;
     let es;
-
     function open() {
       es = new EventSource(url);
-
       es.addEventListener("inject", async (e) => {
         let payload;
         try { payload = JSON.parse(e.data); }
         catch { payload = { text: e.data, submit: true }; }
-
         const text   = payload.text   ?? "";
         const submit = payload.submit ?? true;
         const msgId  = payload.id     ?? null;
-
         if (!text) return;
         log("info", "📥 Push received", { text: text.slice(0, 80), submit, id: msgId });
-
         const sent = await typeIntoInput(text, submit);
-
-        // ACK back to server
         try {
           await fetch(PUSH_ACK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tab: TAB_ID, id: msgId, sent }),
           });
-        } catch { /* ACK failure is non-critical */ }
+        } catch { }
       });
-
       es.onerror = () => {
-        log("error", `❌ Push channel error — reconnecting in ${backoff}ms`, {});
         es.close();
         setTimeout(() => { backoff = Math.min(backoff * 2, 30_000); open(); }, backoff);
       };
-
       es.onopen = () => { backoff = 1000; };
     }
-
     open();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 9. UTILITIES
+  // 10. UTILITIES
   // ══════════════════════════════════════════════════════════════════════════
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -679,13 +721,13 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 10. TERMINAL PANEL
+  // 11. TERMINAL PANEL
   // ══════════════════════════════════════════════════════════════════════════
   let _panel    = null;
   let _logCont  = null;
   let _filter   = "all";
   let _isFs     = false;
-  let _savedPos = { top:"20px", right:"20px", left:"auto", width:"440px", height:"560px" };
+  let _savedPos = { top:"20px", right:"20px", left:"auto", width:"460px", height:"600px" };
 
   const TSTYLE = {
     request: { bg:"#1e1e2e", border:"#89b4fa", hBg:"#89b4fa22", c:"#89b4fa" },
@@ -695,6 +737,21 @@
     info:    { bg:"#1e1e2e", border:"#cba6f7", hBg:"#cba6f722", c:"#cba6f7" },
     user:    { bg:"#1a1a2e", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
     ai:      { bg:"#1a2a1a", border:"#94e2d5", hBg:"#94e2d522", c:"#94e2d5" },
+  };
+
+  const LLM_STATE_COLORS = {
+    generating:  "#f38ba8",
+    idle:        "#6c7086",
+    injectable:  "#a6e3a1",
+    injecting:   "#89b4fa",
+    unknown:     "#6c7086",
+  };
+
+  const BTN_STATE_COLORS = {
+    active:     "#a6e3a1",
+    disabled:   "#f9e2af",
+    not_found:  "#f38ba8",
+    unknown:    "#6c7086",
   };
 
   function initPanel() {
@@ -710,6 +767,7 @@
       "z-index:999999", "overflow:hidden", "box-sizing:border-box",
     ].join(";");
 
+    // Header
     const hdr = document.createElement("div");
     hdr.id = "vbc-hdr";
     hdr.style.cssText = "padding:0 12px;height:44px;background:#11111b;color:#cdd6f4;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none;border-bottom:1px solid #313244;flex-shrink:0;";
@@ -720,18 +778,42 @@
         <span style="color:#a6e3a1;font-size:10px;">⬤</span>
         <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">VibesCode</span>
         <span style="font-size:9px;padding:2px 6px;border-radius:10px;background:#313244;color:#cba6f7;margin-left:4px;">${PLATFORM.name}</span>
-        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v10</span>
+        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v12</span>
       </div>
       <div style="display:flex;gap:4px;align-items:center;">
+        <button id="vbc-tools-btn" title="List MCP tools" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🔧</button>
+        <button id="vbc-path-btn" title="Set project path" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📁</button>
+        <button id="vbc-shell-btn" title="Run shell command" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">$_</button>
         <button id="vbc-clear" title="Clear logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🗑</button>
         <button id="vbc-export" title="Export logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">💾</button>
         <button id="vbc-fs" title="Fullscreen" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 9px;font-size:10px;cursor:pointer;font-weight:bold;">🗖</button>
       </div>`;
 
+    // Rich status bar
     const statusBar = document.createElement("div");
-    statusBar.style.cssText = "padding:3px 12px;background:#11111b;border-bottom:1px solid #1e1e2e;font-size:10px;color:#6c7086;display:flex;justify-content:space-between;flex-shrink:0;";
-    statusBar.innerHTML = '<span id="vbc-status">⏳ Connecting…</span><span id="vbc-calls">🔧 0 calls</span>';
+    statusBar.style.cssText = "padding:4px 12px;background:#11111b;border-bottom:1px solid #1e1e2e;font-size:10px;color:#6c7086;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;gap:8px;";
+    statusBar.innerHTML = `
+      <span id="vbc-status">⏳ Connecting…</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
+        <span id="vbc-llm-state" style="font-size:9px;padding:1px 5px;border-radius:8px;background:#313244;color:#6c7086;">LLM: unknown</span>
+        <span id="vbc-btn-state" style="font-size:9px;padding:1px 5px;border-radius:8px;background:#313244;color:#6c7086;">BTN: unknown</span>
+        <span id="vbc-calls">🔧 0 calls</span>
+      </div>`;
 
+    // Quick-input bar (for path / shell)
+    const quickBar = document.createElement("div");
+    quickBar.id = "vbc-quick-bar";
+    quickBar.style.cssText = "padding:6px 10px;background:#11111b;border-bottom:1px solid #1e1e2e;display:none;flex-shrink:0;";
+    quickBar.innerHTML = `
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span id="vbc-quick-label" style="font-size:10px;color:#6c7086;min-width:60px;">Path:</span>
+        <input id="vbc-quick-input" type="text" placeholder="Paste path or command…"
+          style="flex:1;background:#1e1e2e;border:1px solid #313244;border-radius:4px;color:#cdd6f4;font-family:monospace;font-size:10px;padding:4px 8px;outline:none;" />
+        <button id="vbc-quick-run" style="background:#a6e3a1;color:#1e1e2e;border:none;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:bold;">Run</button>
+        <button id="vbc-quick-close" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 6px;font-size:10px;cursor:pointer;">✕</button>
+      </div>`;
+
+    // Tabs
     const tabs = document.createElement("div");
     tabs.id = "vbc-tabs";
     tabs.style.cssText = "display:flex;gap:4px;padding:6px 10px;background:#181825;border-bottom:1px solid #313244;flex-shrink:0;";
@@ -750,15 +832,53 @@
 
     _panel.appendChild(hdr);
     _panel.appendChild(statusBar);
+    _panel.appendChild(quickBar);
     _panel.appendChild(tabs);
     _panel.appendChild(_logCont);
     document.body.appendChild(_panel);
 
     _makeDraggable(_panel, hdr);
 
+    // Button handlers
     document.getElementById("vbc-fs").addEventListener("click", e => { e.stopPropagation(); _toggleFs(); });
     document.getElementById("vbc-clear").addEventListener("click", e => { e.stopPropagation(); _logCont.innerHTML = ""; });
     document.getElementById("vbc-export").addEventListener("click", e => { e.stopPropagation(); _export(); });
+
+    // Path button
+    document.getElementById("vbc-path-btn").addEventListener("click", e => {
+      e.stopPropagation();
+      _showQuickBar("Path:", "Paste project path (e.g. /home/user/myapp)", async (val) => {
+        if (!val) return;
+        const result = await McpClient.callTool("detect_root", { hint: val });
+        log("success", "📁 Root set", { result: result.text });
+      });
+    });
+
+    // Shell button
+    document.getElementById("vbc-shell-btn").addEventListener("click", e => {
+      e.stopPropagation();
+      _showQuickBar("$ Shell:", "Enter shell command…", async (val) => {
+        if (!val) return;
+        log("info", `🖥 Running: ${val}`, {});
+        const result = await McpClient.callTool("shell", { cmd: val });
+        log(result.ok ? "success" : "error", `$ ${val}`, { output: result.text });
+      });
+    });
+
+    // Tools list button
+    document.getElementById("vbc-tools-btn").addEventListener("click", async e => {
+      e.stopPropagation();
+      try {
+        const resp = await fetch(`${MCP_BASE_URL}/tools`);
+        const data = await resp.json();
+        const lines = (data.tools || []).map(t => `• ${t.name}: ${t.description}`).join("\n");
+        log("info", `🔧 ${data.total} tools registered`, { tools: lines });
+      } catch (err) {
+        log("error", "❌ Could not fetch tools", { error: err.message });
+      }
+    });
+
+    // Tab filter
     tabs.addEventListener("click", e => {
       const btn = e.target.closest("button[data-f]");
       if (!btn) return;
@@ -771,6 +891,43 @@
       });
       _applyFilter(_filter);
     });
+
+    // Quick bar run/close
+    document.getElementById("vbc-quick-run").addEventListener("click", async () => {
+      const val = document.getElementById("vbc-quick-input").value.trim();
+      if (_quickCallback) await _quickCallback(val);
+      _hideQuickBar();
+    });
+    document.getElementById("vbc-quick-close").addEventListener("click", _hideQuickBar);
+    document.getElementById("vbc-quick-input").addEventListener("keydown", async e => {
+      if (e.key === "Enter") {
+        const val = e.target.value.trim();
+        if (_quickCallback) await _quickCallback(val);
+        _hideQuickBar();
+      }
+      if (e.key === "Escape") _hideQuickBar();
+    });
+  }
+
+  let _quickCallback = null;
+
+  function _showQuickBar(label, placeholder, callback) {
+    const bar = document.getElementById("vbc-quick-bar");
+    const inp = document.getElementById("vbc-quick-input");
+    const lbl = document.getElementById("vbc-quick-label");
+    if (!bar) return;
+    lbl.textContent = label;
+    inp.placeholder = placeholder;
+    inp.value = "";
+    bar.style.display = "block";
+    inp.focus();
+    _quickCallback = callback;
+  }
+
+  function _hideQuickBar() {
+    const bar = document.getElementById("vbc-quick-bar");
+    if (bar) bar.style.display = "none";
+    _quickCallback = null;
   }
 
   function _applyFilter(f) {
@@ -785,8 +942,22 @@
     });
   }
 
-  function updateStatus(txt) { const e = document.getElementById("vbc-status"); if (e) e.textContent = txt; }
-  function updateCallCount(n) { const e = document.getElementById("vbc-calls"); if (e) e.textContent = `🔧 ${n} call${n!==1?"s":""}`; }
+  function updateStatus(txt)      { const e = document.getElementById("vbc-status");  if (e) e.textContent = txt; }
+  function updateCallCount(n)     { const e = document.getElementById("vbc-calls");   if (e) e.textContent = `🔧 ${n} call${n!==1?"s":""}`; }
+  function updateMcpBadge(ready)  { const e = document.getElementById("vbc-mcp-badge"); if (e) { e.style.color = ready ? "#a6e3a1" : "#f38ba8"; e.textContent = ready ? "MCP ✓" : "MCP ✗"; } }
+
+  function updateStatusBar(llmState, btnStatus) {
+    const llmEl = document.getElementById("vbc-llm-state");
+    const btnEl = document.getElementById("vbc-btn-state");
+    if (llmEl) {
+      llmEl.textContent = `LLM: ${llmState}`;
+      llmEl.style.color = LLM_STATE_COLORS[llmState] || "#6c7086";
+    }
+    if (btnEl) {
+      btnEl.textContent = `BTN: ${btnStatus}`;
+      btnEl.style.color = BTN_STATE_COLORS[btnStatus] || "#6c7086";
+    }
+  }
 
   function log(type, title, data = {}) {
     initPanel();
@@ -872,13 +1043,14 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 11. BOOT
+  // 12. BOOT
   // ══════════════════════════════════════════════════════════════════════════
   initPanel();
-  log("info", "🚀 VibesCode v10 (MCP)", { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
+  log("info", "🚀 VibesCode v12 (MCP)", { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
 
   McpClient.connect();
   connectPushChannel();
+  startHeartbeat();
 
   setTimeout(() => {
     const root = getChatRoot();
@@ -889,7 +1061,6 @@
     log("info", "👁 Watching DOM", { root: root.tagName || root.nodeName });
   }, 800);
 
-  // SPA navigation reset
   let _lastPath = location.pathname;
   setInterval(() => {
     if (location.pathname !== _lastPath) {
@@ -899,5 +1070,5 @@
     }
   }, 1_000);
 
-  console.log("[VibesCode v10] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
+  console.log("[VibesCode v12] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
 })();

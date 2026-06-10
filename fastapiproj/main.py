@@ -1,5 +1,5 @@
 """
-main.py — VibesCode Agent v11
+main.py — VibesCode Agent v12
 ══════════════════════════════════════════════════════════════════════════════
 Single-port FastAPI server.  All endpoints:
 
@@ -11,29 +11,29 @@ Single-port FastAPI server.  All endpoints:
   Extension ↔ Server
   ─────────────────────────────────────────────────────
   GET  /push/stream          Server→Extension SSE channel
-  POST /push/send            Enqueue message → AI chat   ← use this from curl/API
+  POST /push/send            Enqueue message → AI chat
   POST /push/ack             Extension ACKs after inject
   POST /ext/heartbeat        Extension reports its live state every 2s
-  GET  /ext/status           Poll current extension+LLM state
+  GET  /ext/status           Rich extension+LLM state (generating, send button, etc.)
 
-  Project root management (dynamic, any drive, any language)
+  Project root management
   ─────────────────────────────────────────────────────
   GET  /project/root         Get current project root
-  POST /project/set          Set project root at runtime
+  POST /project/set          Set project root at runtime (any drive)
   POST /project/detect       Auto-detect root from a hint path
 
   Meta
   ─────────────────────────────────────────────────────
   GET  /health               Full health + queue depth + ext status
-  GET  /tools                List registered MCP tools
+  GET  /tools                List registered MCP tools (JSON)
   GET  /docs                 Swagger UI
 
 Run:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-Environment variables:
-    VIBESCODE_PROJECT_ROOT   Initial project root (optional; can be changed at runtime)
-    VIBESCODE_SECRET         Shared token for /push/send auth (optional but recommended)
+Environment:
+    VIBESCODE_PROJECT_ROOT   Initial project root (optional)
+    VIBESCODE_SECRET         Shared token for /push/send auth (optional)
 ══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -64,12 +64,14 @@ logging.basicConfig(
 logger = logging.getLogger("vibescode")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROJECT ROOT  — fully dynamic, changeable at runtime via API
+# PROJECT ROOT  — fully dynamic, changeable at runtime via API or MCP tool
 # ══════════════════════════════════════════════════════════════════════════════
 _project_root: str = os.environ.get("VIBESCODE_PROJECT_ROOT", os.getcwd())
 
+
 def get_project_root() -> str:
     return _project_root
+
 
 def set_project_root(path: str) -> str:
     global _project_root
@@ -82,8 +84,10 @@ def set_project_root(path: str) -> str:
     logger.info("Project root changed to: %s", _project_root)
     return _project_root
 
+
 def _root() -> Path:
     return Path(get_project_root())
+
 
 def _safe(rel: str) -> Path:
     """
@@ -94,14 +98,13 @@ def _safe(rel: str) -> Path:
     """
     p = Path(rel).expanduser()
     if p.is_absolute():
-        # Allow any absolute path — the user explicitly pointed here
         return p.resolve()
-    # Relative — must stay inside project root
     root = _root()
     target = (root / rel).resolve()
     if not str(target).startswith(str(root)):
         raise ValueError(f"Path traversal blocked: {rel!r}")
     return target
+
 
 def _run(cmd: str, timeout: int = 60, cwd: str | None = None) -> str:
     """Run a shell command; returns combined stdout + stderr."""
@@ -117,43 +120,56 @@ def _run(cmd: str, timeout: int = 60, cwd: str | None = None) -> str:
     except Exception as exc:
         return f"ERROR: {exc}"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# EXTENSION STATE  — heartbeat registry, injection queue
+# EXTENSION STATE  — heartbeat registry + rich LLM status
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExtensionState:
     """
     Tracks the live state reported by the browser extension every ~2s.
 
-    llm_state values (reported by extension DOM scan):
+    llm_state values:
         "generating"  — AI is currently streaming a response
-        "idle"        — AI finished, input is empty, send button may be inactive
-        "injectable"  — input is empty and ready; safe to inject a new message
+        "idle"        — AI finished; input is empty
+        "injectable"  — input empty, send button active; safe to inject
         "injecting"   — extension is currently typing/sending
         "unknown"     — no heartbeat received yet
 
-    injectable == True when it's safe to inject the next queued message.
+    send_button_status:
+        "active"      — button visible and not disabled
+        "disabled"    — button found but disabled (e.g. empty input)
+        "not_found"   — no send button detected
+        "unknown"     — not yet reported
     """
+
     def __init__(self):
-        self.connected:    bool  = False
-        self.tab_id:       str   = ""
-        self.platform:     str   = ""
-        self.llm_state:    str   = "unknown"   # generating | idle | injectable | injecting
-        self.last_seen:    float = 0.0
-        self.inject_ack:   dict  = {}          # last ACK from extension
-        self.mcp_ready:    bool  = False
-        self.queue_depth:  int   = 0
+        self.connected:           bool  = False
+        self.tab_id:              str   = ""
+        self.platform:            str   = ""
+        self.llm_state:           str   = "unknown"
+        self.send_button_status:  str   = "unknown"
+        self.input_empty:         bool  = True
+        self.bot_typing:          bool  = False
+        self.page_url:            str   = ""
+        self.last_seen:           float = 0.0
+        self.inject_ack:          dict  = {}
+        self.mcp_ready:           bool  = False
+        self.queue_depth:         int   = 0
 
     def update(self, data: dict):
-        self.connected   = True
-        self.tab_id      = data.get("tab_id", self.tab_id)
-        self.platform    = data.get("platform", self.platform)
-        self.llm_state   = data.get("llm_state", self.llm_state)
-        self.mcp_ready   = data.get("mcp_ready", self.mcp_ready)
-        self.last_seen   = time.time()
+        self.connected          = True
+        self.tab_id             = data.get("tab_id",             self.tab_id)
+        self.platform           = data.get("platform",           self.platform)
+        self.llm_state          = data.get("llm_state",          self.llm_state)
+        self.send_button_status = data.get("send_button_status", self.send_button_status)
+        self.input_empty        = data.get("input_empty",        self.input_empty)
+        self.bot_typing         = data.get("bot_typing",         self.bot_typing)
+        self.page_url           = data.get("page_url",           self.page_url)
+        self.mcp_ready          = data.get("mcp_ready",          self.mcp_ready)
+        self.last_seen          = time.time()
 
     def is_stale(self) -> bool:
-        """No heartbeat for >8s → extension probably disconnected."""
         return self.connected and (time.time() - self.last_seen > 8.0)
 
     def can_inject(self) -> bool:
@@ -164,33 +180,38 @@ class ExtensionState:
     def to_dict(self) -> dict:
         age = round(time.time() - self.last_seen, 1) if self.last_seen else None
         return {
-            "connected":   self.connected and not self.is_stale(),
-            "stale":       self.is_stale(),
-            "tab_id":      self.tab_id,
-            "platform":    self.platform,
-            "llm_state":   self.llm_state,
-            "mcp_ready":   self.mcp_ready,
-            "can_inject":  self.can_inject(),
-            "last_seen_s": age,
-            "queue_depth": _push_queue.qsize() if _push_queue else 0,
-            "inject_ack":  self.inject_ack,
+            # Connection
+            "connected":           self.connected and not self.is_stale(),
+            "stale":               self.is_stale(),
+            "tab_id":              self.tab_id,
+            "platform":            self.platform,
+            "page_url":            self.page_url,
+            # LLM / UI state
+            "llm_state":           self.llm_state,
+            "is_generating":       self.bot_typing,
+            "send_button_status":  self.send_button_status,
+            "send_button_active":  self.send_button_status == "active",
+            "input_empty":         self.input_empty,
+            # Injection readiness
+            "mcp_ready":           self.mcp_ready,
+            "can_inject":          self.can_inject(),
+            "last_seen_s":         age,
+            "queue_depth":         _push_queue.qsize() if _push_queue else 0,
+            "inject_ack":          self.inject_ack,
         }
 
 
 _ext_state = ExtensionState()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUSH QUEUE  — messages wait here until extension is injectable
+# PUSH QUEUE
 # ══════════════════════════════════════════════════════════════════════════════
 _push_queue: asyncio.Queue[dict] = asyncio.Queue()
-_push_clients: dict[str, asyncio.Queue] = {}   # tab_id → per-client queue
+_push_clients: dict[str, asyncio.Queue] = {}
 _event_loop: asyncio.AbstractEventLoop | None = None
 
+
 def push_to_extension(text: str, submit: bool = True, msg_id: str | None = None) -> str:
-    """
-    Thread-safe enqueue.  Returns the message ID.
-    The dispatcher task (below) will inject it when the extension is ready.
-    """
     global _event_loop
     mid = msg_id or str(uuid.uuid4())[:8]
     envelope = {"text": text, "submit": submit, "id": mid, "queued_at": time.time()}
@@ -200,26 +221,18 @@ def push_to_extension(text: str, submit: bool = True, msg_id: str | None = None)
         logger.warning("[push] Event loop not ready — message dropped: %.80s", text)
     return mid
 
+
 async def _push_dispatcher():
-    """
-    Background task.
-    Drains _push_queue and forwards each message to connected SSE clients,
-    but only when the extension reports it is injectable.
-    Messages that cannot be sent immediately are re-queued after a short wait.
-    """
     while True:
         envelope = await _push_queue.get()
         text = envelope.get("text", "")
-
-        # Wait until injectable (up to 120s total, then drop with a warning)
         deadline = time.time() + 120
         while not _ext_state.can_inject():
             if time.time() > deadline:
-                logger.warning("[dispatcher] Dropped message (timeout waiting injectable): %.80s", text)
+                logger.warning("[dispatcher] Dropped message (timeout): %.80s", text)
                 break
             await asyncio.sleep(0.4)
         else:
-            # Broadcast to all connected SSE clients
             payload = json.dumps(envelope)
             dead_tabs = []
             for tab_id, q in list(_push_clients.items()):
@@ -229,12 +242,9 @@ async def _push_dispatcher():
                     dead_tabs.append(tab_id)
             for tab_id in dead_tabs:
                 _push_clients.pop(tab_id, None)
-                logger.warning("[dispatcher] Removed full/dead client: %s", tab_id)
-
             logger.info("[dispatcher] Injected msg %s: %.80s", envelope.get("id"), text)
-
-        # Brief cooldown so extension has time to actually start injecting
         await asyncio.sleep(0.5)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FASTMCP TOOLS
@@ -245,9 +255,103 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
              ".mypy_cache", ".next", "dist", "build", ".turbo", "coverage",
              ".cache", "out", ".nuxt", ".svelte-kit"}
 
+# ── Project root tools (AI-callable) ──────────────────────────────────────────
+
+@mcp.tool()
+def set_root(path: str) -> str:
+    """
+    Set the project root dynamically to any absolute path on any drive.
+
+    Examples:
+        {"path": "C:\\Users\\user\\Desktop\\myapp"}
+        {"path": "/home/user/projects/myapp"}
+        {"path": "D:\\work\\backend"}
+
+    The agent should call this at the start of every session when the user
+    mentions a project path, or when switching to a different project.
+    Returns the resolved absolute path of the new root.
+    """
+    try:
+        new_root = set_project_root(path)
+        return f"OK: project root set to {new_root}"
+    except ValueError as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def detect_root(hint: str) -> str:
+    """
+    Auto-detect project root from any file or folder path inside the project.
+
+    Walks up from the hint path until it finds a project marker
+    (package.json, pyproject.toml, Cargo.toml, go.mod, .git, manage.py, etc.)
+
+    Example:
+        {"hint": "C:\\Users\\user\\Desktop\\myapp\\src\\index.tsx"}
+        → detects C:\\Users\\user\\Desktop\\myapp as root
+
+    Use this when the user pastes a file path or folder path and you need
+    to determine the project root automatically.
+    """
+    MARKERS = {
+        "package.json", "pyproject.toml", "setup.py", "manage.py", "Cargo.toml",
+        "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", ".git",
+        "Makefile", "next.config.js", "next.config.ts", "vite.config.ts",
+    }
+    p = Path(hint).expanduser().resolve()
+    if p.is_file():
+        p = p.parent
+    candidate = p
+    for _ in range(10):
+        if any((candidate / m).exists() for m in MARKERS):
+            try:
+                new_root = set_project_root(str(candidate))
+                return f"OK: project root detected and set to {new_root}"
+            except ValueError as e:
+                return f"ERROR: {e}"
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    try:
+        new_root = set_project_root(str(p))
+        return f"OK: no project marker found; set root to hint directory {new_root}"
+    except ValueError as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def list_mcp_tools() -> str:
+    """
+    List all available MCP tools with their descriptions.
+
+    Use this to remind yourself which operations are available, or to show
+    the user what tools are registered in this session.
+    Returns a formatted list of tool names and short descriptions.
+    """
+    raw_tools = _get_registered_tools()
+    if not raw_tools:
+        return "No tools registered (or tool registry not yet available)."
+    lines = ["Available MCP tools:\n"]
+    for t in raw_tools:
+        name = getattr(t, "name", t.get("name", "?") if isinstance(t, dict) else "?")
+        desc = getattr(t, "description", t.get("description", "") if isinstance(t, dict) else "") or ""
+        short_desc = desc.strip().split("\n")[0][:120]
+        lines.append(f"  • {name}: {short_desc}")
+    return "\n".join(lines)
+
+
+# ── File & directory tools ─────────────────────────────────────────────────────
+
 @mcp.tool()
 def tree(path: str = ".") -> str:
-    """Recursive directory tree.  path can be absolute or relative to project root."""
+    """
+    Recursive directory tree.
+
+    path: absolute path (any drive) or relative to project root.
+    Use "." to list the current project root.
+    Use set_root first if the project root is not yet set correctly.
+    """
     try:
         root = _safe(path)
     except ValueError as e:
@@ -267,7 +371,11 @@ def tree(path: str = ".") -> str:
 
 @mcp.tool()
 def dir_list(path: str = ".") -> str:
-    """List immediate contents of a directory."""
+    """
+    List immediate contents of a directory.
+
+    path: absolute path (any drive) or relative to project root.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -280,7 +388,12 @@ def dir_list(path: str = ".") -> str:
 
 @mcp.tool()
 def cat(path: str) -> str:
-    """Read full file.  path can be absolute (any drive) or relative to project root."""
+    """
+    Read full file contents.
+
+    path: absolute path (any drive) or relative to project root.
+    Large files are truncated at 8000 chars — use cat_range to page through them.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -301,7 +414,13 @@ def cat(path: str) -> str:
 
 @mcp.tool()
 def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
-    """Read a line slice from a file.  path can be absolute or relative."""
+    """
+    Read a specific line range from a file.
+
+    path: absolute path or relative to project root.
+    start_line / end_line: 1-based line numbers (inclusive).
+    Use this to page through files that were truncated by cat.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -319,7 +438,14 @@ def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
 
 @mcp.tool()
 def search(pattern: str, path: str = ".", extensions: str = "") -> str:
-    """Regex search across files.  path can be absolute or relative."""
+    """
+    Regex search across files.
+
+    pattern: Python regex (case-insensitive).
+    path: root directory to search (absolute or relative). Defaults to project root.
+    extensions: comma-separated list, e.g. ".py,.ts" to filter by file type.
+    Returns up to 200 matching lines with file:line: content format.
+    """
     try:
         root = _safe(path)
     except ValueError as e:
@@ -341,7 +467,7 @@ def search(pattern: str, path: str = ".", extensions: str = "") -> str:
                     try:
                         rel = fpath.relative_to(_root())
                     except ValueError:
-                        rel = fpath  # absolute path outside root — show full path
+                        rel = fpath
                     results.append(f"{rel}:{i}: {line.rstrip()}")
                     if len(results) >= 200:
                         results.append("… (200 match limit)")
@@ -353,7 +479,14 @@ def search(pattern: str, path: str = ".", extensions: str = "") -> str:
 
 @mcp.tool()
 def write(path: str, content: str) -> str:
-    """Create or overwrite a file.  path can be absolute or relative."""
+    """
+    Create or overwrite a file.
+
+    path: absolute path (any drive) or relative to project root.
+    content: full file content as a string.
+    Parent directories are created automatically.
+    CAUTION: overwrites existing files. Prefer patch for targeted edits.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -366,7 +499,14 @@ def write(path: str, content: str) -> str:
 
 @mcp.tool()
 def patch(path: str, old_str: str, new_str: str) -> str:
-    """Atomic find-and-replace in a file.  path can be absolute or relative."""
+    """
+    Atomic find-and-replace in a file.
+
+    path: absolute path or relative to project root.
+    old_str: exact string to find (must appear exactly once in the file).
+    new_str: replacement string.
+    Always cat the file first to confirm old_str is present and unique.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -377,6 +517,9 @@ def patch(path: str, old_str: str, new_str: str) -> str:
     if old_str not in text:
         snippet = text[:400] + ("…" if len(text) > 400 else "")
         return f"ERROR: old_str not found in {path}.\nFile preview:\n{snippet}"
+    count = text.count(old_str)
+    if count > 1:
+        return f"ERROR: old_str appears {count} times — make it more specific so it matches exactly once."
     updated = text.replace(old_str, new_str, 1)
     target.write_text(updated, encoding="utf-8")
     return f"OK: patched {path}"
@@ -384,7 +527,7 @@ def patch(path: str, old_str: str, new_str: str) -> str:
 
 @mcp.tool()
 def mkdir(path: str) -> str:
-    """Create a directory (including parents)."""
+    """Create a directory (and all parents). path: absolute or relative."""
     try:
         target = _safe(path)
     except ValueError as e:
@@ -395,7 +538,12 @@ def mkdir(path: str) -> str:
 
 @mcp.tool()
 def delete(path: str) -> str:
-    """Delete a single file."""
+    """
+    Delete a single file.
+
+    path: absolute or relative to project root.
+    To remove a directory use shell with rmdir/rm -rf.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -408,13 +556,31 @@ def delete(path: str) -> str:
     return f"OK: deleted {path}"
 
 
+# ── Shell / execution tools ───────────────────────────────────────────────────
+
 @mcp.tool()
-def shell(cmd: str, cwd: str = "") -> str:
+def shell(cmd: str, cwd: str = "", timeout: int = 120) -> str:
     """
-    Run any shell command.
-    cwd: optional working directory (absolute or relative to project root).
-    Defaults to project root.
-    Works for Python, Node, npm, cargo, go, make — any runtime.
+    Execute any shell command with full power.
+
+    cmd:     Shell command string — supports pipes, redirection, &&, ||, etc.
+    cwd:     Working directory (absolute or relative to project root).
+             Defaults to project root if empty.
+    timeout: Seconds before the command is killed. Default 120, max 600.
+
+    Works for ALL runtimes: Python, Node, npm/yarn/pnpm, Rust/cargo,
+    Go, Java/Maven/Gradle, Ruby, PHP, Make, Docker, git, curl, etc.
+
+    Examples:
+        {"cmd": "npm install && npm run build"}
+        {"cmd": "python -m pytest tests/ -v --tb=short"}
+        {"cmd": "cargo build --release"}
+        {"cmd": "git log --oneline -20"}
+        {"cmd": "find . -name '*.py' | xargs wc -l"}
+        {"cmd": "cat /etc/os-release"}
+
+    CAUTION: This runs with the same permissions as the server process.
+    Avoid destructive commands (rm -rf, DROP TABLE, etc.) unless explicitly requested.
     """
     work = get_project_root()
     if cwd:
@@ -422,16 +588,23 @@ def shell(cmd: str, cwd: str = "") -> str:
             work = str(_safe(cwd))
         except ValueError as e:
             return f"ERROR: {e}"
-    logger.info("[shell] %s  (cwd=%s)", cmd, work)
-    return _run(cmd, timeout=120, cwd=work)
+    timeout = min(timeout, 600)
+    logger.info("[shell] %s  (cwd=%s, timeout=%ss)", cmd, work, timeout)
+    return _run(cmd, timeout=timeout, cwd=work)
 
 
 @mcp.tool()
 def run_tests(cmd: str = "", path: str = ".") -> str:
     """
-    Run tests for any project type.
-    cmd: custom test command (e.g. 'npm test', 'cargo test', 'pytest', 'go test ./...')
-    If cmd is empty, auto-detects based on project files.
+    Run the project's test suite.
+
+    cmd: custom command (e.g. 'npm test', 'cargo test', 'pytest tests/').
+    Auto-detects framework if cmd is empty:
+      - package.json  → npm test
+      - Cargo.toml    → cargo test
+      - go.mod        → go test ./...
+      - pyproject.toml / setup.py → pytest
+      - Makefile      → make test
     """
     root = _root()
     if not cmd:
@@ -453,9 +626,13 @@ def run_tests(cmd: str = "", path: str = ".") -> str:
 @mcp.tool()
 def lint(cmd: str = "", path: str = ".") -> str:
     """
-    Run linter for any project type.
-    cmd: custom lint command (e.g. 'eslint src', 'cargo clippy', 'flake8')
-    Auto-detects if cmd is empty.
+    Run the project's linter.
+
+    cmd: custom command. Auto-detects if empty:
+      - package.json  → npm run lint
+      - Cargo.toml    → cargo clippy
+      - .eslintrc.*   → npx eslint
+      - otherwise     → flake8
     """
     root = _root()
     if not cmd:
@@ -470,15 +647,22 @@ def lint(cmd: str = "", path: str = ".") -> str:
     return _run(cmd, timeout=60)
 
 
+# ── Git tools ─────────────────────────────────────────────────────────────────
+
 @mcp.tool()
 def git_status() -> str:
-    """Git status."""
+    """Show git working tree status (short format with branch)."""
     return _run("git status --short --branch")
 
 
 @mcp.tool()
 def git_diff(path: str = "", staged: bool = False) -> str:
-    """Git diff."""
+    """
+    Show git diff.
+
+    path: optional file/directory to scope the diff.
+    staged: if True, show staged (--cached) diff.
+    """
     cmd = "git diff" + (" --cached" if staged else "")
     if path:
         cmd += f" -- {path}"
@@ -487,12 +671,19 @@ def git_diff(path: str = "", staged: bool = False) -> str:
 
 @mcp.tool()
 def git_log(n: int = 10, path: str = "") -> str:
-    """Git log."""
+    """
+    Show git commit history (one-line format).
+
+    n: number of commits (default 10).
+    path: optional file/directory to scope the log.
+    """
     cmd = f"git log --oneline -{n}"
     if path:
         cmd += f" -- {path}"
     return _run(cmd)
 
+
+# ── Info tools ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def get_root() -> str:
@@ -503,12 +694,14 @@ def get_root() -> str:
 @mcp.tool()
 def project_info() -> str:
     """
-    Detect project type and give a summary.
-    Works for Python, Node/React/Vue/Next, Rust, Go, Java, Ruby, PHP, etc.
+    Detect project type and summarise the workspace.
+
+    Returns framework/language markers found in the project root,
+    top file types by count, and the resolved project root path.
+    Useful at the start of a session to orient yourself before exploring.
     """
     root = _root()
     info: list[str] = [f"Project root: {root}"]
-
     markers = {
         "package.json":      "Node.js / JavaScript / TypeScript",
         "next.config.js":    "Next.js",
@@ -534,8 +727,6 @@ def project_info() -> str:
     for fname, label in markers.items():
         if (root / fname).exists():
             info.append(f"  ✓ {label}  ({fname})")
-
-    # Count files by extension
     ext_counts: dict[str, int] = {}
     for f in root.rglob("*"):
         if any(p in SKIP_DIRS for p in f.parts) or not f.is_file():
@@ -544,7 +735,6 @@ def project_info() -> str:
     top = sorted(ext_counts.items(), key=lambda x: -x[1])[:8]
     if top:
         info.append("  File types: " + ", ".join(f"{ext or 'no-ext'}×{n}" for ext, n in top))
-
     return "\n".join(info)
 
 
@@ -555,17 +745,16 @@ def project_info() -> str:
 async def lifespan(app: FastAPI):
     global _event_loop
     _event_loop = asyncio.get_running_loop()
-    # Start the injection dispatcher
     asyncio.create_task(_push_dispatcher())
-    logger.info("VibesCode v11 started — root: %s", get_project_root())
+    logger.info("VibesCode v12 started — root: %s", get_project_root())
     yield
     logger.info("VibesCode shutting down")
 
 
 app = FastAPI(
-    title="VibesCode Agent v11",
-    description="MCP-powered coding agent with live extension state tracking",
-    version="11.0.0",
+    title="VibesCode Agent v12",
+    description="MCP-powered coding agent with dynamic project root and rich status",
+    version="12.0.0",
     lifespan=lifespan,
 )
 
@@ -578,205 +767,15 @@ app.add_middleware(
 
 app.mount("/mcp", mcp.http_app(transport="sse"))
 
-# ── Optional shared-secret auth helper ────────────────────────────────────────
 SECRET = os.environ.get("VIBESCODE_SECRET", "")
+
 
 def _check_auth(x_token: str | None):
     if SECRET and x_token != SECRET:
         raise HTTPException(status_code=403, detail="Invalid X-Token")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EXTENSION ↔ SERVER ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════════
 
-async def _per_client_generator(tab_id: str) -> AsyncGenerator[bytes, None]:
-    """SSE generator for a specific tab; uses a per-client queue."""
-    q: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
-    _push_clients[tab_id] = q
-    try:
-        yield b": connected\n\n"
-        while True:
-            try:
-                payload = await asyncio.wait_for(q.get(), timeout=15.0)
-                yield f"event: inject\ndata: {payload}\n\n".encode()
-            except asyncio.TimeoutError:
-                yield b": keep-alive\n\n"
-    finally:
-        _push_clients.pop(tab_id, None)
-        logger.info("[push] Client disconnected: %s", tab_id)
-
-
-@app.get("/push/stream", tags=["Extension"])
-async def push_stream(request: Request, tab: str = "default"):
-    """
-    SSE channel: extension connects here to receive injected messages.
-    Each tab gets its own queue — safe for multiple tabs/windows.
-    """
-    return StreamingResponse(
-        _per_client_generator(tab),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-class PushRequest(BaseModel):
-    text: str
-    submit: bool = True
-    id: Optional[str] = None
-
-
-@app.post("/push/send", tags=["Extension"])
-async def push_send(body: PushRequest, x_token: str | None = Header(default=None)) -> dict:
-    """
-    Enqueue a message to be injected into the AI chat.
-    The dispatcher waits until the extension reports 'injectable' state before sending.
-
-    Example:
-        curl -X POST http://localhost:8000/push/send \\
-          -H "Content-Type: application/json" \\
-          -d '{"text": "Run the tests and fix any failures.", "submit": true}'
-    """
-    _check_auth(x_token)
-    if not body.text.strip():
-        raise HTTPException(status_code=400, detail="text must not be empty")
-    mid = push_to_extension(body.text, body.submit, body.id)
-    return {
-        "ok":        True,
-        "id":        mid,
-        "queued":    body.text[:80],
-        "queue_depth": _push_queue.qsize(),
-        "ext_state": _ext_state.to_dict(),
-    }
-
-
-class AckRequest(BaseModel):
-    tab_id: str = ""
-    id:     str = ""
-    sent:   bool = True
-
-
-@app.post("/push/ack", tags=["Extension"])
-async def push_ack(body: AckRequest) -> dict:
-    """Extension calls this after successfully injecting a message."""
-    _ext_state.inject_ack = {"id": body.id, "sent": body.sent, "at": time.time()}
-    logger.info("[ack] tab=%s id=%s sent=%s", body.tab_id, body.id, body.sent)
-    return {"ok": True}
-
-
-class HeartbeatRequest(BaseModel):
-    tab_id:    str  = ""
-    platform:  str  = ""
-    llm_state: str  = "unknown"   # generating | idle | injectable | injecting
-    mcp_ready: bool = False
-
-
-@app.post("/ext/heartbeat", tags=["Extension"])
-async def ext_heartbeat(body: HeartbeatRequest) -> dict:
-    """
-    Extension POSTs this every ~2s with its live state.
-    Server uses this to decide when it's safe to inject the next queued message.
-    """
-    _ext_state.update(body.model_dump())
-    return {"ok": True, "queue_depth": _push_queue.qsize()}
-
-
-@app.get("/ext/status", tags=["Extension"])
-async def ext_status() -> dict:
-    """
-    Returns the full live state of the extension + LLM.
-
-    llm_state:
-        "generating"  — AI is streaming a response right now
-        "idle"        — AI is done; input box may be empty
-        "injectable"  — safe to inject a new message
-        "injecting"   — extension is currently typing/sending
-        "unknown"     — no heartbeat received yet
-
-    can_inject:
-        True when it is safe to send the next queued message.
-    """
-    return _ext_state.to_dict()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PROJECT ROOT ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-class SetRootRequest(BaseModel):
-    path: str   # absolute path on any drive, e.g. C:\Users\me\myapp  or  /home/me/myapp
-
-
-@app.get("/project/root", tags=["Project"])
-async def project_root_get() -> dict:
-    """Get the current project root."""
-    return {"root": get_project_root(), "exists": Path(get_project_root()).exists()}
-
-
-@app.post("/project/set", tags=["Project"])
-async def project_root_set(body: SetRootRequest) -> dict:
-    """
-    Set the project root at runtime — no server restart needed.
-    Works for any path on any drive (Windows C:\\, D:\\, Linux /home/, etc.)
-
-    Example:
-        curl -X POST http://localhost:8000/project/set \\
-          -H "Content-Type: application/json" \\
-          -d '{"path": "C:\\\\Users\\\\luckey\\\\Desktop\\\\myreactapp"}'
-    """
-    try:
-        new_root = set_project_root(body.path)
-        return {"ok": True, "root": new_root}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-class DetectRootRequest(BaseModel):
-    hint: str   # any file or folder path inside the project
-
-
-@app.post("/project/detect", tags=["Project"])
-async def project_root_detect(body: DetectRootRequest) -> dict:
-    """
-    Auto-detect project root from a hint path (any file or folder inside the project).
-    Walks up from hint until it finds a known project marker
-    (package.json, pyproject.toml, Cargo.toml, go.mod, .git, manage.py, etc.)
-
-    Example:
-        {"hint": "C:\\Users\\luckey\\Desktop\\myapp\\src\\index.tsx"}
-        → detects "C:\\Users\\luckey\\Desktop\\myapp" as root
-    """
-    MARKERS = {
-        "package.json", "pyproject.toml", "setup.py", "manage.py", "Cargo.toml",
-        "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", ".git",
-        "Makefile", "next.config.js", "next.config.ts", "vite.config.ts",
-    }
-    p = Path(body.hint).expanduser().resolve()
-    if p.is_file():
-        p = p.parent
-    candidate = p
-    for _ in range(10):  # walk up max 10 levels
-        if any((candidate / m).exists() for m in MARKERS):
-            try:
-                new_root = set_project_root(str(candidate))
-                return {"ok": True, "root": new_root, "detected_from": str(p)}
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-        parent = candidate.parent
-        if parent == candidate:
-            break
-        candidate = parent
-    # No marker found — just use the hint directory itself
-    try:
-        new_root = set_project_root(str(p))
-        return {"ok": True, "root": new_root, "detected_from": str(p), "warning": "No project marker found; using hint directory"}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# META ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Tool registry helper ──────────────────────────────────────────────────────
 def _get_registered_tools() -> list:
     try:
         tm = getattr(mcp, "_tool_manager", None)
@@ -794,9 +793,199 @@ def _get_registered_tools() -> list:
     return []
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTENSION ↔ SERVER ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _per_client_generator(tab_id: str) -> AsyncGenerator[bytes, None]:
+    q: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
+    _push_clients[tab_id] = q
+    try:
+        yield b": connected\n\n"
+        while True:
+            try:
+                payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                yield f"event: inject\ndata: {payload}\n\n".encode()
+            except asyncio.TimeoutError:
+                yield b": keep-alive\n\n"
+    finally:
+        _push_clients.pop(tab_id, None)
+        logger.info("[push] Client disconnected: %s", tab_id)
+
+
+@app.get("/push/stream", tags=["Extension"])
+async def push_stream(request: Request, tab: str = "default"):
+    return StreamingResponse(
+        _per_client_generator(tab),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class PushRequest(BaseModel):
+    text: str
+    submit: bool = True
+    id: Optional[str] = None
+
+
+@app.post("/push/send", tags=["Extension"])
+async def push_send(body: PushRequest, x_token: str | None = Header(default=None)) -> dict:
+    """
+    Enqueue a message to be injected into the AI chat.
+
+    Waits for the extension to report 'injectable' state before sending.
+    Messages that aren't delivered within 120s are dropped with a warning.
+
+    Example:
+        curl -X POST http://localhost:8000/push/send \\
+          -H "Content-Type: application/json" \\
+          -d '{"text": "Run the tests and fix any failures.", "submit": true}'
+    """
+    _check_auth(x_token)
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+    mid = push_to_extension(body.text, body.submit, body.id)
+    return {
+        "ok":          True,
+        "id":          mid,
+        "queued":      body.text[:80],
+        "queue_depth": _push_queue.qsize(),
+        "ext_state":   _ext_state.to_dict(),
+    }
+
+
+class AckRequest(BaseModel):
+    tab_id: str = ""
+    id:     str = ""
+    sent:   bool = True
+
+
+@app.post("/push/ack", tags=["Extension"])
+async def push_ack(body: AckRequest) -> dict:
+    _ext_state.inject_ack = {"id": body.id, "sent": body.sent, "at": time.time()}
+    logger.info("[ack] tab=%s id=%s sent=%s", body.tab_id, body.id, body.sent)
+    return {"ok": True}
+
+
+class HeartbeatRequest(BaseModel):
+    tab_id:           str  = ""
+    platform:         str  = ""
+    llm_state:        str  = "unknown"
+    send_button_status: str = "unknown"   # active | disabled | not_found | unknown
+    input_empty:      bool = True
+    bot_typing:       bool = False
+    page_url:         str  = ""
+    mcp_ready:        bool = False
+
+
+@app.post("/ext/heartbeat", tags=["Extension"])
+async def ext_heartbeat(body: HeartbeatRequest) -> dict:
+    """
+    Extension POSTs this every ~2s with its live state.
+
+    send_button_status:
+        "active"    — button found and not disabled
+        "disabled"  — button found but grayed out
+        "not_found" — no button detected on the page
+        "unknown"   — not yet determined
+    """
+    _ext_state.update(body.model_dump())
+    return {"ok": True, "queue_depth": _push_queue.qsize()}
+
+
+@app.get("/ext/status", tags=["Extension"])
+async def ext_status() -> dict:
+    """
+    Returns the full live state of the extension + LLM.
+
+    Key fields:
+        is_generating:       True while the AI is streaming a response
+        llm_state:           generating | idle | injectable | injecting | unknown
+        send_button_status:  active | disabled | not_found | unknown
+        send_button_active:  convenience bool — True when button is clickable
+        input_empty:         True when the chat input box is empty
+        can_inject:          True when it is safe to push the next message
+        connected:           True when extension heartbeat is recent (<8s)
+        stale:               True when heartbeat is older than 8s
+    """
+    return _ext_state.to_dict()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROJECT ROOT HTTP ENDPOINTS  (mirrors the MCP tools for REST clients)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SetRootRequest(BaseModel):
+    path: str
+
+
+@app.get("/project/root", tags=["Project"])
+async def project_root_get() -> dict:
+    return {"root": get_project_root(), "exists": Path(get_project_root()).exists()}
+
+
+@app.post("/project/set", tags=["Project"])
+async def project_root_set(body: SetRootRequest) -> dict:
+    """
+    Set the project root at runtime — no server restart needed.
+
+    Example:
+        curl -X POST http://localhost:8000/project/set \\
+          -d '{"path": "C:\\\\Users\\\\user\\\\Desktop\\\\myapp"}'
+    """
+    try:
+        new_root = set_project_root(body.path)
+        return {"ok": True, "root": new_root}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class DetectRootRequest(BaseModel):
+    hint: str
+
+
+@app.post("/project/detect", tags=["Project"])
+async def project_root_detect(body: DetectRootRequest) -> dict:
+    """
+    Auto-detect project root from any file or folder path inside the project.
+
+    Example:
+        {"hint": "C:\\Users\\user\\Desktop\\myapp\\src\\index.tsx"}
+    """
+    MARKERS = {
+        "package.json", "pyproject.toml", "setup.py", "manage.py", "Cargo.toml",
+        "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", ".git",
+        "Makefile", "next.config.js", "next.config.ts", "vite.config.ts",
+    }
+    p = Path(body.hint).expanduser().resolve()
+    if p.is_file():
+        p = p.parent
+    candidate = p
+    for _ in range(10):
+        if any((candidate / m).exists() for m in MARKERS):
+            try:
+                new_root = set_project_root(str(candidate))
+                return {"ok": True, "root": new_root, "detected_from": str(p)}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    try:
+        new_root = set_project_root(str(p))
+        return {"ok": True, "root": new_root, "detected_from": str(p),
+                "warning": "No project marker found; using hint directory"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# META ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/health", tags=["Meta"])
 async def health() -> dict:
-    """Full health check including extension state and queue depth."""
     raw_tools = _get_registered_tools()
     tool_names = []
     for t in raw_tools:
@@ -804,27 +993,27 @@ async def health() -> dict:
         if name:
             tool_names.append(name)
     return {
-        "ok":          True,
-        "server":      "vibescode-agent",
-        "version":     "11.0.0",
+        "ok":           True,
+        "server":       "vibescode-agent",
+        "version":      "12.0.0",
         "project_root": get_project_root(),
-        "tools":       tool_names,
-        "tool_count":  len(tool_names),
-        "queue_depth": _push_queue.qsize(),
-        "extension":   _ext_state.to_dict(),
-        "timestamp":   time.time(),
+        "tools":        tool_names,
+        "tool_count":   len(tool_names),
+        "queue_depth":  _push_queue.qsize(),
+        "extension":    _ext_state.to_dict(),
+        "timestamp":    time.time(),
     }
 
 
 @app.get("/tools", tags=["Meta"])
-async def list_tools() -> dict:
-    """List all MCP tools."""
+async def list_tools_endpoint() -> dict:
+    """List all MCP tools with names and descriptions."""
     raw_tools = _get_registered_tools()
     tools = []
     for t in raw_tools:
         name = getattr(t, "name", t.get("name", "?") if isinstance(t, dict) else "?")
         desc = getattr(t, "description", t.get("description", "") if isinstance(t, dict) else "") or ""
-        tools.append({"name": name, "description": desc.split("\n")[0]})
+        tools.append({"name": name, "description": desc.strip().split("\n")[0][:200]})
     return {"tools": tools, "total": len(tools)}
 
 

@@ -1,6 +1,42 @@
-# VibesCode — Browser Extension + MCP Agent v11
+# VibesCode — Browser Extension + MCP Agent v12
 
-A browser extension that turns any AI chat (Gemini, ChatGPT, Claude, Perplexity) into a live coding agent connected to your local project via the official MCP protocol. Works with **any project type** on **any drive** — Python, React, Next.js, Node, Rust, Go, and more.
+A browser extension that turns any AI chat (Gemini, ChatGPT, Claude, Perplexity) into a live coding agent connected to your local project via the official MCP protocol.
+
+---
+
+## What's New in v12
+
+### Shell Power Tool
+`shell` now accepts `cwd` and `timeout` parameters and runs with full permissions — pipes, redirects, `&&`, any runtime.
+
+### Dynamic Project Root via MCP
+The AI can now set its own project root mid-conversation using `set_root` or `detect_root` MCP tools. Just paste a path into the chat and it auto-detects.
+
+### `list_mcp_tools` MCP Tool
+The AI can call `list_mcp_tools` to see every registered operation — useful at the start of a session or after connecting to a new server.
+
+### Rich `/ext/status`
+`GET /ext/status` now returns:
+```json
+{
+  "connected": true,
+  "llm_state": "injectable",
+  "is_generating": false,
+  "send_button_status": "active",
+  "send_button_active": true,
+  "input_empty": true,
+  "can_inject": true,
+  "platform": "Claude",
+  "page_url": "https://claude.ai/...",
+  "stale": false
+}
+```
+
+### Panel Upgrades
+- 📁 button → paste any path to set project root instantly
+- `$_` button → run any shell command from the panel
+- 🔧 button → shows full tool list from `/tools`
+- Live status bar shows LLM state + send button status with color codes
 
 ---
 
@@ -23,18 +59,10 @@ You type a task in Gemini / ChatGPT / Claude
    Extension checks LLM state → waits for "injectable"
           │
           ▼
-   Injects result into chat + submits (4-strategy fallback)
+   Injects result into chat + submits
           │
           ▼
    AI sees the file content and continues working
-```
-
-The server also has a **push channel** — send any message into the AI chat from curl, Python, CI/CD, or any HTTP client:
-
-```bash
-curl -X POST http://localhost:8000/push/send \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Run the tests and fix any failures.", "submit": true}'
 ```
 
 ---
@@ -43,15 +71,13 @@ curl -X POST http://localhost:8000/push/send \
 
 ```
 vibescode/
-├── README.md                        ← this file
-├── SYSTEM_PROMPT.md                 ← paste into AI custom instructions
-│
-├── main.py                          ← FastAPI server (single port, all features)
-│
+├── README.md
+├── SYSTEM_PROMPT.md        ← paste into AI custom instructions
+├── main.py                 ← FastAPI server
 └── extension/
     ├── manifest.json
-    ├── content.js                   ← MCP client + AI chat interceptor + heartbeat
-    └── background.js                ← config storage only
+    ├── content.js          ← MCP client + AI interceptor + heartbeat + panel
+    └── background.js       ← config storage only
 ```
 
 ---
@@ -59,16 +85,11 @@ vibescode/
 ## Quick Start
 
 ```bash
-# Install dependencies
 pip install fastapi uvicorn fastmcp anyio
 
-# Optional: set initial project root (can be changed at runtime via API)
 export VIBESCODE_PROJECT_ROOT=/path/to/your/project
+export VIBESCODE_SECRET=mysecret     # optional auth
 
-# Optional: set a shared secret for /push/send auth
-export VIBESCODE_SECRET=mysecret
-
-# Run on port 8000
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -76,96 +97,59 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ## Extension Setup
 
-1. Open Chrome → `chrome://extensions/` → Enable **Developer mode**
-2. Click **Load unpacked** → select the `extension/` folder
-3. Edit `content.js` line 10 — set `MCP_BASE_URL` to your server address
-4. Paste `SYSTEM_PROMPT.md` into the AI's custom instructions / system prompt
-5. Open Gemini, ChatGPT, Claude, or Perplexity and start working
-
-The terminal panel appears in the top-right corner of the page. It shows live LLM state, queue depth, MCP status, and a full log of every tool call.
+1. Chrome → `chrome://extensions/` → Enable Developer mode
+2. Load unpacked → select `extension/` folder
+3. Edit `content.js` line ~12 — set `MCP_BASE_URL` to your server
+4. Paste `SYSTEM_PROMPT.md` into the AI's custom instructions
+5. Open any supported AI chat and start working
 
 ---
 
 ## Setting the Project Root
 
-The project root can be set **at runtime** without restarting the server. It accepts any absolute path on any drive.
+**Via the AI (preferred — just tell it):**
+> "My project is at C:\Users\me\Desktop\myapp"
+> 
+> → AI emits: `AGENT_CALL {"op":"detect_root","hint":"C:\\Users\\me\\Desktop\\myapp"}`
+
+**Via the panel:** Click 📁 and paste any path
 
 **Via API:**
 ```bash
 # Set directly
 curl -X POST http://localhost:8000/project/set \
-  -H "Content-Type: application/json" \
-  -d '{"path": "C:\\Users\\luckey\\Desktop\\myreactapp"}'
+  -d '{"path": "/home/user/myapp"}'
 
 # Auto-detect from any file inside the project
 curl -X POST http://localhost:8000/project/detect \
-  -H "Content-Type: application/json" \
-  -d '{"hint": "C:\\Users\\luckey\\Desktop\\myapp\\src\\index.tsx"}'
-
-# Check current root
-curl http://localhost:8000/project/root
+  -d '{"hint": "C:\\Users\\user\\Desktop\\myapp\\src\\index.tsx"}'
 ```
-
-**Via the panel:** Click the 📁 button in the terminal panel header and paste any path.
-
-`project/detect` walks up from the hint path looking for `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `.git`, `manage.py`, and other project markers.
 
 ---
 
-## Sending Messages to the AI from Your Backend
+## Rich Status API
 
 ```bash
-# curl
-curl -X POST http://localhost:8000/push/send \
-  -H "Content-Type: application/json" \
-  -d '{"text": "The deploy finished. Check if /api/health returns 200.", "submit": true}'
-
-# With auth token (if VIBESCODE_SECRET is set)
-curl -X POST http://localhost:8000/push/send \
-  -H "Content-Type: application/json" \
-  -H "X-Token: mysecret" \
-  -d '{"text": "Tests are failing in CI. Fix them."}'
-
-# Fill input but don't submit — let user review first
-curl -X POST http://localhost:8000/push/send \
-  -d '{"text": "Review these changes before committing.", "submit": false}'
-```
-
-**From Python:**
-```python
-from main import push_to_extension
-
-push_to_extension("Run pytest and fix any failures.")
-push_to_extension("Review these changes before committing.", submit=False)
-```
-
-Messages are **queued server-side** and only injected when the extension reports the LLM is ready (`llm_state: "injectable"`). If the AI is currently generating, the message waits automatically — no manual timing needed.
-
----
-
-## Checking Extension & LLM Status
-
-```bash
-# Full live status
 curl http://localhost:8000/ext/status
-
-# Full health (includes queue depth, tools list, project root)
-curl http://localhost:8000/health
 ```
 
-**`/ext/status` response:**
 ```json
 {
   "connected": true,
   "stale": false,
   "tab_id": "a3f9c12b",
-  "platform": "Gemini",
+  "platform": "Claude",
+  "page_url": "https://claude.ai/chat/...",
   "llm_state": "injectable",
+  "is_generating": false,
+  "send_button_status": "active",
+  "send_button_active": true,
+  "input_empty": true,
   "mcp_ready": true,
   "can_inject": true,
   "last_seen_s": 1.2,
   "queue_depth": 0,
-  "inject_ack": { "id": "msg_7", "sent": true, "at": 1718000000.0 }
+  "inject_ack": {"id": "msg_7", "sent": true, "at": 1718000000.0}
 }
 ```
 
@@ -179,56 +163,69 @@ curl http://localhost:8000/health
 | `injecting` | Extension is currently typing/sending |
 | `unknown` | No heartbeat received yet |
 
-`can_inject: true` means it is safe to send the next queued message right now.
+**`send_button_status` values:**
 
-The extension sends a heartbeat POST every 2 seconds. If no heartbeat arrives for 8 seconds, `connected` flips to `false` and `stale` to `true`.
-
----
-
-## How the AI Calls Tools
-
-Paste `SYSTEM_PROMPT.md` into the AI. The AI emits one-line tool calls:
-
-```
-AGENT_CALL {"op":"cat","path":"src/app/views.py"}
-```
-
-The extension intercepts this (MutationObserver on the full joined text of all AI message nodes — fixing the split-node parse error on Gemini), calls your MCP server via JSON-RPC 2.0, and injects the result back:
-
-```
-__TOOL_RESULT__
-op: cat
-# file contents here...
-__END_RESULT__
-
-Continue based on the result above.
-```
+| Status | Meaning |
+|--------|---------|
+| `active` | Button found and clickable |
+| `disabled` | Button found but grayed out (input may be empty) |
+| `not_found` | No send button detected on the page |
+| `unknown` | Not yet determined |
 
 ---
 
-## Available Tools
+## Push Messages from API / CI
 
-| op | Parameters | What it does |
-|----|------------|--------------|
-| `tree` | `path` | Recursive directory listing |
-| `dir` | `path` | Immediate directory contents |
-| `cat` | `path` | Read full file |
-| `cat_range` | `path`, `start_line`, `end_line` | Read line slice |
-| `search` | `pattern`, `path`, `extensions` | Regex search across files |
-| `write` | `path`, `content` | Create or overwrite file |
-| `patch` | `path`, `old_str`, `new_str` | Atomic find-and-replace |
-| `mkdir` | `path` | Create directory |
-| `delete` | `path` | Delete file |
-| `shell` | `cmd`, `cwd` | Run any shell command (any runtime) |
-| `run_tests` | `cmd`, `path` | Run tests — auto-detects npm/pytest/cargo/go |
-| `lint` | `cmd`, `path` | Run linter — auto-detects eslint/clippy/flake8 |
-| `git_status` | — | Git status |
-| `git_diff` | `path`, `staged` | Git diff |
-| `git_log` | `n`, `path` | Git history |
-| `get_root` | — | Return current project root |
-| `project_info` | — | Detect project type and file summary |
+```bash
+# Simple push
+curl -X POST http://localhost:8000/push/send \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Run tests and fix failures.", "submit": true}'
 
-All `path` parameters accept **absolute paths on any drive** (`C:\...`, `D:\...`, `/home/...`) or paths relative to the project root.
+# With auth
+curl -X POST http://localhost:8000/push/send \
+  -H "X-Token: mysecret" \
+  -d '{"text": "Deploy failed. Check logs at /var/log/app.log"}'
+
+# Fill input only (let user review)
+curl -X POST http://localhost:8000/push/send \
+  -d '{"text": "Review these changes.", "submit": false}'
+```
+
+**From Python:**
+```python
+from main import push_to_extension
+
+push_to_extension("Run pytest and fix any failures.")
+push_to_extension("Review these changes before committing.", submit=False)
+```
+
+---
+
+## Shell Examples the AI Can Run
+
+```
+# Any runtime
+AGENT_CALL {"op":"shell","cmd":"pip install -r requirements.txt"}
+AGENT_CALL {"op":"shell","cmd":"npm install && npm run build"}
+AGENT_CALL {"op":"shell","cmd":"cargo build --release","timeout":300}
+AGENT_CALL {"op":"shell","cmd":"go test ./..."}
+
+# Django
+AGENT_CALL {"op":"shell","cmd":"python manage.py makemigrations && python manage.py migrate"}
+AGENT_CALL {"op":"shell","cmd":"python manage.py collectstatic --noinput"}
+
+# Search
+AGENT_CALL {"op":"shell","cmd":"grep -r 'TODO' src/ --include='*.py'"}
+AGENT_CALL {"op":"shell","cmd":"find . -name '*.log' -mtime -1"}
+
+# Git
+AGENT_CALL {"op":"shell","cmd":"git add . && git commit -m 'fix: resolve failing tests'"}
+AGENT_CALL {"op":"shell","cmd":"git stash && git pull && git stash pop"}
+
+# Custom cwd
+AGENT_CALL {"op":"shell","cmd":"ls -la","cwd":"/var/log"}
+```
 
 ---
 
@@ -242,41 +239,40 @@ All `path` parameters accept **absolute paths on any drive** (`C:\...`, `D:\...`
 | POST | `/push/send` | Enqueue message → AI chat |
 | POST | `/push/ack` | Extension ACKs after inject |
 | POST | `/ext/heartbeat` | Extension reports live state |
-| GET | `/ext/status` | Poll extension + LLM state |
+| GET | `/ext/status` | Rich extension + LLM state |
 | GET | `/project/root` | Get current project root |
 | POST | `/project/set` | Set project root at runtime |
 | POST | `/project/detect` | Auto-detect root from hint path |
 | GET | `/health` | Full health check |
-| GET | `/tools` | List registered MCP tools |
+| GET | `/tools` | List registered MCP tools (JSON) |
 | GET | `/docs` | Swagger UI |
 
 ---
 
-## Supported AI Platforms
+## MCP Tools Available to the AI
 
-| Platform | Status |
-|----------|--------|
-| Gemini | ✅ |
-| ChatGPT | ✅ |
-| Claude.ai | ✅ |
-| Perplexity | ✅ |
-| Any chat UI | ✅ (Generic fallback) |
-
----
-
-## Supported Project Types
-
-Works on any project the shell can reach. `run_tests` and `lint` auto-detect:
-
-| Stack | Test command | Lint command |
-|-------|-------------|--------------|
-| Python / Django / FastAPI | `pytest` | `flake8` |
-| Node / React / Next.js | `npm test` | `npm run lint` / `eslint` |
-| Vite / Vue / Nuxt | `npm test` | `npm run lint` |
-| Rust | `cargo test` | `cargo clippy` |
-| Go | `go test ./...` | — |
-| Java (Maven) | `mvn test` via shell | — |
-| Ruby | `bundle exec rspec` via shell | — |
+| Tool | Description |
+|------|-------------|
+| `set_root` | Set project root to any absolute path |
+| `detect_root` | Auto-detect root from any file/folder path |
+| `get_root` | Return current root |
+| `list_mcp_tools` | List all tools with descriptions |
+| `tree` | Recursive directory listing |
+| `dir_list` | Immediate directory contents |
+| `cat` | Read full file |
+| `cat_range` | Read line slice |
+| `search` | Regex search across files |
+| `write` | Create or overwrite file |
+| `patch` | Atomic find-and-replace |
+| `mkdir` | Create directory |
+| `delete` | Delete file |
+| `shell` | Run any shell command |
+| `run_tests` | Run test suite (auto-detects framework) |
+| `lint` | Run linter (auto-detects framework) |
+| `git_status` | Git status |
+| `git_diff` | Git diff |
+| `git_log` | Git history |
+| `project_info` | Detect project type and file summary |
 
 ---
 
@@ -285,7 +281,7 @@ Works on any project the shell can reach. `run_tests` and `lint` auto-detect:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VIBESCODE_PROJECT_ROOT` | `cwd` | Initial project root |
-| `VIBESCODE_SECRET` | *(empty)* | Shared token for `/push/send` auth (`X-Token` header) |
+| `VIBESCODE_SECRET` | *(empty)* | Auth token for `/push/send` (`X-Token` header) |
 | `PORT` | `8000` | Server port |
 
 ---
@@ -293,12 +289,12 @@ Works on any project the shell can reach. `run_tests` and `lint` auto-detect:
 ## Known Limitations
 
 **Security**
-- `shell` has no command allowlist — the AI can run any shell command. Add a blocklist or confirmation step before running destructive commands in production.
+- `shell` has no allowlist — the AI can run any command. Add a confirmation step before destructive operations in production environments.
 - Set `VIBESCODE_SECRET` if the server is reachable from outside localhost.
 
 **Reliability**
-- Tool results are capped at 6000 chars. Large files are silently truncated — use `cat_range` to page through them.
-- Push queue messages time out after 120 seconds if the extension never reaches `injectable` state (e.g. browser closed).
+- Tool results are capped at 6000 chars. Large files are truncated — use `cat_range` to page through them.
+- Push queue messages time out after 120s if the extension never reaches `injectable`.
 
 **`execCommand` deprecation**
-- Chrome is phasing out `document.execCommand`. The extension has 4 injection strategies (execCommand → InputEvent → clipboard paste → force-assign) as fallback, but clipboard requires the `clipboardWrite` permission in `manifest.json`.
+- Chrome is phasing out `document.execCommand`. The extension uses 4 injection strategies as fallback (execCommand → InputEvent → clipboard paste → force-assign).

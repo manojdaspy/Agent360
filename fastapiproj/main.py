@@ -320,27 +320,30 @@ def detect_root(hint: str) -> str:
         return f"ERROR: {e}"
 
 
+
+import inspect
+
 @mcp.tool()
-def list_mcp_tools() -> str:
-    """
-    List all available MCP tools with their descriptions.
+async def list_mcp_tools() -> str:
+    tools = None
 
-    Use this to remind yourself which operations are available, or to show
-    the user what tools are registered in this session.
-    Returns a formatted list of tool names and short descriptions.
-    """
-    raw_tools = _get_registered_tools()
-    if not raw_tools:
-        return "No tools registered (or tool registry not yet available)."
+    if hasattr(mcp, "list_tools"):
+        maybe = mcp.list_tools()
+        if inspect.isawaitable(maybe):
+            tools = await maybe
+        else:
+            tools = maybe
+
+    if not tools:
+        return "No tools registered (registry not ready or async unavailable)."
+
     lines = ["Available MCP tools:\n"]
-    for t in raw_tools:
-        name = getattr(t, "name", t.get("name", "?") if isinstance(t, dict) else "?")
-        desc = getattr(t, "description", t.get("description", "") if isinstance(t, dict) else "") or ""
-        short_desc = desc.strip().split("\n")[0][:120]
-        lines.append(f"  • {name}: {short_desc}")
+    for t in tools:
+        name = getattr(t, "name", str(t))
+        desc = getattr(t, "description", "") or getattr(t, "__doc__", "")
+        lines.append(f"  • {name}: {desc.splitlines()[0][:120]}")
+
     return "\n".join(lines)
-
-
 # ── File & directory tools ─────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -765,7 +768,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/mcp", mcp.http_app(transport="sse"))
+# app.mount("/mcp", mcp.http_app(transport="sse"))
+mcp_app = mcp.http_app(transport="sse")   # or omit transport= for Streamable HTTP
+app.mount("/mcp", mcp_app)
 
 SECRET = os.environ.get("VIBESCODE_SECRET", "")
 

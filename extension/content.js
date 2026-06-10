@@ -1,16 +1,12 @@
-// content.js — VibesCode Agent v12 (Final)
+// content.js — VibesCode Agent v13 (Final+)
 // ════════════════════════════════════════════════════════════════════════════
-// Fixes applied over v12 original:
-//   • Real tool queue (no more recursive scheduleToolCall)
-//   • MutationObserver debounced (250ms) — massive CPU reduction
-//   • Streaming guard in scanAiMessages (no mid-stream parse errors)
-//   • Heartbeat failure counter with panel warning
-//   • Auto root detection on boot (3s delay)
-//   • Smart result chunking (4000 char chunks)
-//   • Improved send button detection (heuristic fallback)
-//   • Tool execution history (last 100, accessible via panel)
-//   • Call timeout protection (30s per MCP call)
-//   • Persistent session state (queue + root in localStorage)
+// Improvements over v12:
+//   • Background tab — detailed event log for EVERYTHING the agent does
+//   • Tool tab — only shows MCP hit / waiting / received
+//   • Panel is resizable (drag any edge/corner) and hideable (toggle button)
+//   • Path normalization: \\ and \ → / (fixes Windows parse errors)
+//   • cat results are NEVER chunked — full content injected as one message
+//   • All ops have clear logging at every lifecycle stage
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
   "use strict";
@@ -18,16 +14,16 @@
   // ══════════════════════════════════════════════════════════════════════════
   // 0. CONFIG
   // ══════════════════════════════════════════════════════════════════════════
-  const MCP_BASE_URL  = "https://studentassignment.lyralogics.com";
-  const MCP_SSE_URL   = `${MCP_BASE_URL}/mcp/sse`;
-  const MCP_POST_URL  = `${MCP_BASE_URL}/mcp/messages`;
-  const PUSH_SSE_URL  = `${MCP_BASE_URL}/push/stream`;
-  const PUSH_ACK_URL  = `${MCP_BASE_URL}/push/ack`;
-  const HEARTBEAT_URL = `${MCP_BASE_URL}/ext/heartbeat`;
+  const MCP_BASE_URL   = "https://studentassignment.lyralogics.com";
+  const MCP_SSE_URL    = `${MCP_BASE_URL}/mcp/sse`;
+  const PUSH_SSE_URL   = `${MCP_BASE_URL}/push/stream`;
+  const PUSH_ACK_URL   = `${MCP_BASE_URL}/push/ack`;
+  const HEARTBEAT_URL  = `${MCP_BASE_URL}/ext/heartbeat`;
 
-  const TAB_ID               = Math.random().toString(36).slice(2, 10);
+  const TAB_ID                = Math.random().toString(36).slice(2, 10);
   const HEARTBEAT_INTERVAL_MS = 2000;
   const TOOL_CALL_TIMEOUT_MS  = 30_000;
+  // Only ops that are NOT cat will be chunked
   const CHUNK_SIZE            = 4000;
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -142,7 +138,27 @@
   ];
 
   const PLATFORM = PLATFORMS.find(p => p.match(location.hostname));
-  console.log("[VibesCode v12-final] Platform:", PLATFORM.name);
+  console.log("[VibesCode v13+] Platform:", PLATFORM.name);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PATH NORMALIZATION — fix Windows backslash paths
+  // ══════════════════════════════════════════════════════════════════════════
+  function normalizePath(str) {
+    if (typeof str !== "string") return str;
+    // Double backslash → single backslash → forward slash
+    return str.replace(/\\\\/g, "/").replace(/\\/g, "/");
+  }
+
+  function normalizeCallPaths(call) {
+    const pathKeys = ["path", "hint", "cwd", "old_str", "new_str"];
+    const result = { ...call };
+    for (const key of pathKeys) {
+      if (typeof result[key] === "string") {
+        result[key] = normalizePath(result[key]);
+      }
+    }
+    return result;
+  }
 
   // ══════════════════════════════════════════════════════════════════════════
   // 2. DOM HELPERS
@@ -166,12 +182,10 @@
   };
 
   const getSendBtn = () => {
-    // Try platform-specific selectors first
     for (const sel of PLATFORM.sendBtns) {
       const btn = $(sel);
       if (btn && isVisible(btn) && !btn.disabled) return btn;
     }
-    // Heuristic fallback: find small buttons with SVG and send-like labels
     const buttons = $$("button");
     for (const btn of buttons) {
       const rect = btn.getBoundingClientRect();
@@ -183,7 +197,6 @@
         if (/send|submit|arrow|up/.test(txt)) return btn;
       }
     }
-    // Last resort: any visible non-disabled button with send-like text
     const allBtns = $$('button:not([disabled])');
     for (const btn of allBtns) {
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || "").toLowerCase();
@@ -255,29 +268,20 @@
     input.focus();
     await sleep(80);
     if (tryExecCommand(input, text)) {
-      log("info", "📝 Injected via execCommand", { chars: text.length });
+      bgLog("inject", "📝 Injected via execCommand", { chars: text.length });
       return true;
     }
     if (tryInputEvent(input, text)) {
-      log("info", "📝 Injected via InputEvent", { chars: text.length });
+      bgLog("inject", "📝 Injected via InputEvent", { chars: text.length });
       return true;
     }
     if (await tryClipboardPaste(input, text)) {
-      log("info", "📝 Injected via clipboard paste", { chars: text.length });
+      bgLog("inject", "📝 Injected via clipboard paste", { chars: text.length });
       return true;
     }
     forceAssign(input, text);
-    log("warn", "📝 Injected via force-assign", { chars: text.length });
+    bgLog("warn", "📝 Injected via force-assign (fallback)", { chars: text.length });
     return true;
-  }
-
-  // Native character-by-character typing fallback (for platforms that block synthetic events)
-  async function nativeTyping(input, text) {
-    input.focus();
-    for (const ch of text) {
-      document.execCommand("insertText", false, ch);
-      await sleep(5);
-    }
   }
 
   function tryExecCommand(input, text) {
@@ -365,29 +369,30 @@
   // 4. SEND BUTTON
   // ══════════════════════════════════════════════════════════════════════════
   async function triggerSend(input) {
+    bgLog("inject", "🖱️ Looking for send button...", {});
     const btn = await pollForSendButton(6000);
     if (btn) {
+      bgLog("inject", "🖱️ Clicking send button", { label: btn.getAttribute("aria-label") || btn.className });
       btn.focus();
       btn.click();
-      log("info", "📨 Sent via button.click()", { button: btn.getAttribute("aria-label") || btn.className });
       return true;
     }
-    log("warn", "⚠️ Send button not found — trying keyboard fallbacks");
+    bgLog("warn", "⚠️ Send button not found — trying keyboard fallbacks", {});
     for (const keyOpts of (PLATFORM.sendKeys || [])) {
       dispatchKey(input, keyOpts);
       await sleep(120);
       if (getInputValue(input).length === 0) {
-        log("info", "📨 Sent via keyboard shortcut", { key: keyOpts.key });
+        bgLog("inject", "⌨️ Sent via keyboard shortcut", { key: keyOpts.key });
         return true;
       }
     }
     dispatchKey(input, { key: "Enter", code: "Enter", keyCode: 13 });
     await sleep(200);
     if (getInputValue(input).length === 0) {
-      log("info", "📨 Sent via Enter fallback");
+      bgLog("inject", "⌨️ Sent via Enter fallback", {});
       return true;
     }
-    log("error", "❌ All send strategies failed");
+    bgLog("error", "❌ All send strategies failed", {});
     return false;
   }
 
@@ -431,17 +436,21 @@
   // 5. typeIntoInput
   // ══════════════════════════════════════════════════════════════════════════
   async function typeIntoInput(text, submit = true) {
+    bgLog("inject", "⏳ Waiting for AI to finish (if generating)...", {});
     await waitUntil(() => !isBotTyping(), 60_000);
     await sleep(300);
     const input = getInput();
     if (!input) {
-      log("error", "⚠️ No input box found", { platform: PLATFORM.name });
+      bgLog("error", "⚠️ No input box found", { platform: PLATFORM.name });
       return false;
     }
+    bgLog("inject", "✍️ Injecting text into input", { chars: text.length, preview: text.slice(0, 80) });
     await injectText(input, text);
     await sleep(150);
     if (!submit) return true;
     const sent = await triggerSend(input);
+    if (sent) bgLog("inject", "✅ Message submitted successfully", {});
+    else bgLog("error", "❌ Message submission failed", {});
     return sent;
   }
 
@@ -457,31 +466,31 @@
     let _backoffMs      = 1000;
 
     function connect() {
-      log("info", "🔌 Connecting to MCP", { url: MCP_SSE_URL });
+      bgLog("mcp", "🔌 Connecting to MCP SSE...", { url: MCP_SSE_URL });
       _sseSource = new EventSource(MCP_SSE_URL);
       _sseSource.addEventListener("endpoint", async (e) => {
         const raw = e.data.trim();
         _sessionPostUrl = raw.startsWith("http")
           ? raw
           : MCP_BASE_URL.replace(/\/$/, "") + raw;
-        log("info", "📡 MCP session endpoint", { url: _sessionPostUrl });
+        bgLog("mcp", "📡 MCP session endpoint received", { url: _sessionPostUrl });
         await _initialize();
       });
       _sseSource.addEventListener("message", (e) => {
         let msg;
         try { msg = JSON.parse(e.data); }
-        catch { log("error", "⚠️ MCP parse error", { raw: e.data }); return; }
+        catch { bgLog("error", "⚠️ MCP parse error", { raw: e.data }); return; }
         _handleRpcResponse(msg);
       });
       _sseSource.onerror = () => {
-        log("error", `❌ MCP SSE error — reconnecting in ${_backoffMs}ms`, {});
+        bgLog("error", `❌ MCP SSE error — reconnecting in ${_backoffMs}ms`, {});
         _sseSource.close();
         _initialized = false;
         _sessionPostUrl = null;
         updateMcpBadge(false);
         setTimeout(() => { _backoffMs = Math.min(_backoffMs * 2, 30_000); connect(); }, _backoffMs);
       };
-      _sseSource.onopen = () => { _backoffMs = 1000; };
+      _sseSource.onopen = () => { _backoffMs = 1000; bgLog("mcp", "🟢 MCP SSE connection opened", {}); };
     }
 
     async function _send(method, params = {}) {
@@ -508,25 +517,32 @@
 
     async function _initialize() {
       try {
+        bgLog("mcp", "🤝 Initializing MCP protocol...", {});
         await _send("initialize", {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "vibescode-extension", version: "12.0.0-final" },
+          clientInfo: { name: "vibescode-extension", version: "13.0.0" },
         });
         _initialized = true;
         updateMcpBadge(true);
         updateStatus("✅ MCP Ready");
-        log("success", "✅ MCP initialized", { server: MCP_BASE_URL });
+        bgLog("success", "✅ MCP initialized and ready", { server: MCP_BASE_URL });
       } catch (err) {
-        log("error", "❌ MCP initialize failed", { error: err.message });
+        bgLog("error", "❌ MCP initialize failed", { error: err.message });
       }
     }
 
     async function callTool(name, args = {}) {
       if (!_initialized) throw new Error("MCP not ready");
-      log("request", `📡 TOOL: ${name}`, { args });
 
-      // Timeout protection — a hanging call won't freeze the queue forever
+      // Log: hitting MCP (shown in Tool tab too)
+      toolLog("hit", `📡 HIT MCP: ${name}`, { args });
+      bgLog("mcp", `📤 Calling MCP tool: ${name}`, { args });
+
+      // Log: waiting
+      toolLog("waiting", `⏳ WAITING for MCP: ${name}`, {});
+      bgLog("mcp", `⌛ Waiting for MCP result: ${name}...`, {});
+
       const result = await Promise.race([
         _send("tools/call", { name, arguments: args }),
         new Promise((_, reject) =>
@@ -536,8 +552,15 @@
 
       const text = result?.content?.[0]?.text ?? JSON.stringify(result);
       const ok   = !result?.isError;
-      if (ok) log("success", `✅ ${name}`, { result: text.slice(0, 400) });
-      else    log("error",   `❌ ${name}`, { error: text });
+
+      if (ok) {
+        toolLog("received", `✅ RECEIVED from MCP: ${name}`, { chars: text.length, preview: text.slice(0, 200) });
+        bgLog("success", `✅ MCP result received: ${name}`, { chars: text.length, preview: text.slice(0, 300) });
+      } else {
+        toolLog("error", `❌ MCP ERROR: ${name}`, { error: text });
+        bgLog("error", `❌ MCP tool error: ${name}`, { error: text });
+      }
+
       return { ok, text, raw: result };
     }
 
@@ -545,7 +568,7 @@
   })();
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 7. HEARTBEAT — sends rich state every 2s with failure counter
+  // 7. HEARTBEAT
   // ══════════════════════════════════════════════════════════════════════════
   let HEARTBEAT_FAILURES = 0;
 
@@ -553,11 +576,7 @@
     setInterval(async () => {
       const llmState  = deriveLlmState();
       const btnStatus = getSendButtonStatus();
-      const empty     = isInputEmpty();
-      const typing    = isBotTyping();
-
       updateStatusBar(llmState, btnStatus);
-
       try {
         await fetch(HEARTBEAT_URL, {
           method: "POST",
@@ -567,22 +586,19 @@
             platform:           PLATFORM.name,
             llm_state:          llmState,
             send_button_status: btnStatus,
-            input_empty:        empty,
-            bot_typing:         typing,
+            input_empty:        isInputEmpty(),
+            bot_typing:         isBotTyping(),
             page_url:           location.href,
             mcp_ready:          McpClient.isReady(),
           }),
         });
-        // Reset failure counter on success
         if (HEARTBEAT_FAILURES > 0) {
           HEARTBEAT_FAILURES = 0;
           updateStatus("✅ Heartbeat restored");
         }
       } catch {
         HEARTBEAT_FAILURES++;
-        if (HEARTBEAT_FAILURES > 5) {
-          updateStatus("⚠️ Heartbeat offline");
-        }
+        if (HEARTBEAT_FAILURES > 5) updateStatus("⚠️ Heartbeat offline");
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
@@ -598,8 +614,10 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 9. RESULT CHUNKING
+  // 9. CHUNKING — only for non-cat ops
   // ══════════════════════════════════════════════════════════════════════════
+  const NO_CHUNK_OPS = new Set(["cat", "read", "read_file"]);
+
   function chunkText(text, size = CHUNK_SIZE) {
     const chunks = [];
     for (let i = 0; i < text.length; i += size) {
@@ -631,6 +649,8 @@
     detect_root: "detect_root",
     project_info: "project_info",
     list_mcp_tools: "list_mcp_tools",
+    template_prompt: "template_prompt",
+    cat_range: "cat_range",
   };
 
   const _seenNodes = new WeakSet();
@@ -648,7 +668,6 @@
   let _callCount = 0;
 
   function scanAiMessages() {
-    // Guard: don't parse while the AI is still streaming — prevents malformed JSON
     if (isBotTyping()) return;
 
     const nodes  = $$(PLATFORM.aiMsg);
@@ -663,20 +682,45 @@
       if (_seenTexts.has(fp)) return;
       _seenNodes.add(el);
       _seenTexts.add(fp);
-      log("ai", "🤖 AI", { message: text.length > 300 ? text.slice(0, 300) + "…" : text });
+      bgLog("ai", "🤖 AI message detected", { preview: text.length > 300 ? text.slice(0, 300) + "…" : text });
     });
 
     for (const line of joined.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("AGENT_CALL")) continue;
+      bgLog("dom", "🔍 DOM: AGENT_CALL detected in AI message", { raw: trimmed.slice(0, 120) });
       const jsonPart = trimmed.replace(/^AGENT_CALL\s*:?\s*/, "");
       let call;
       try { call = JSON.parse(jsonPart); }
-      catch { log("error", "⚠️ AGENT_CALL parse error", { line: trimmed }); continue; }
+      catch {
+        bgLog("error", "⚠️ AGENT_CALL JSON parse error — attempting path fix", { line: trimmed });
+        // Try fixing common Windows path issues before giving up
+        const fixed = jsonPart
+          .replace(/\\\\/g, "/")
+          .replace(/\\(?!["\\])/g, "/");
+        try {
+          call = JSON.parse(fixed);
+          bgLog("success", "✅ AGENT_CALL recovered after path fix", { fixed: fixed.slice(0, 120) });
+        } catch {
+          bgLog("error", "❌ AGENT_CALL still unparseable after fix", { line: trimmed });
+          continue;
+        }
+      }
       const callFp = JSON.stringify(call);
       if (_processed.has(callFp)) continue;
       _processed.add(callFp);
-      enqueueToolCall(call);
+
+      // Normalize all path fields in the call
+      const normalizedCall = normalizeCallPaths(call);
+      if (JSON.stringify(normalizedCall) !== JSON.stringify(call)) {
+        bgLog("dom", "🔧 Path normalized (backslash → forward slash)", {
+          original: call.path || call.hint || "",
+          normalized: normalizedCall.path || normalizedCall.hint || "",
+        });
+      }
+
+      bgLog("dom", `📬 Queuing tool call: ${normalizedCall.op}`, { call: normalizedCall });
+      enqueueToolCall(normalizedCall);
       break;
     }
   }
@@ -690,42 +734,45 @@
       if (_seenTexts.has(fp)) return;
       _seenNodes.add(el);
       _seenTexts.add(fp);
-      log("user", "👤 You", { message: text });
+      bgLog("user", "👤 User input detected", { message: text.length > 200 ? text.slice(0, 200) + "…" : text });
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 11. TOOL QUEUE (replaces recursive scheduleToolCall)
+  // 11. TOOL QUEUE
   // ══════════════════════════════════════════════════════════════════════════
   const TOOL_QUEUE = [];
   let PROCESSING_QUEUE = false;
 
   function enqueueToolCall(call) {
     TOOL_QUEUE.push(call);
+    bgLog("queue", `📥 Enqueued: ${call.op} (queue depth: ${TOOL_QUEUE.length})`, {});
     processQueue();
   }
 
   async function processQueue() {
     if (PROCESSING_QUEUE) return;
     PROCESSING_QUEUE = true;
-
     while (TOOL_QUEUE.length > 0) {
       const call = TOOL_QUEUE.shift();
+      bgLog("queue", `▶️ Processing: ${call.op} (${TOOL_QUEUE.length} remaining)`, {});
       try {
         await executeToolCall(call);
       } catch (err) {
-        log("error", "Queue execution failed", { error: err.message });
+        bgLog("error", `❌ Queue execution error: ${call.op}`, { error: err.message });
       }
     }
-
     PROCESSING_QUEUE = false;
+    bgLog("queue", "✅ Queue empty — all done", {});
   }
 
   async function executeToolCall(call) {
     _busy = true;
     updateStatus(`🔧 ${call.op || call.name}`);
+    bgLog("exec", `🚀 Executing: ${call.op}`, { call });
 
     const toolName = OP_TO_TOOL[call.op] || call.op || call.name;
+    const isCatOp  = NO_CHUNK_OPS.has(call.op);
     const { op, name: _n, ...args } = call;
 
     let result;
@@ -734,9 +781,9 @@
       result = await McpClient.callTool(toolName, args);
     } catch (err) {
       result = { ok: false, text: err.message };
+      bgLog("error", `❌ Tool call threw exception: ${toolName}`, { error: err.message });
     }
 
-    // Record in history
     addHistory({
       tool: toolName,
       args,
@@ -748,30 +795,40 @@
     _callCount++;
     updateCallCount(_callCount);
 
-    // Chunk large results and inject sequentially
     const resultText = result.ok ? result.text : `ERROR: ${result.text}`;
-    const chunks = chunkText(resultText, CHUNK_SIZE);
 
-    if (chunks.length === 1) {
-      // Single chunk — original behavior
-      updateStatus("⏳ Injecting result…");
-      const reply =
-        `__TOOL_RESULT__\nop: ${toolName}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
-      const sent = await typeIntoInput(reply, true);
+    if (isCatOp) {
+      // CAT: never chunk — inject full content in one shot
+      bgLog("inject", `📄 cat result: injecting full content (${resultText.length} chars)`, {});
+      updateStatus("⏳ Injecting cat result (full)…");
+      const reply = `__TOOL_RESULT__\nop: ${toolName}\n${resultText}\n__END_RESULT__\n\nContinue based on the result above.`;
+      const sent  = await typeIntoInput(reply, true);
       updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
+      bgLog(sent ? "success" : "error", sent ? `✅ cat inject done` : `❌ cat inject failed`, { chars: reply.length });
     } else {
-      // Multi-chunk: inject each part sequentially
-      for (let i = 0; i < chunks.length; i++) {
-        updateStatus(`⏳ Injecting chunk ${i + 1}/${chunks.length}…`);
-        const isLast = i === chunks.length - 1;
-        const header = i === 0 ? `__TOOL_RESULT__\nop: ${toolName}\n` : `[chunk ${i + 1}/${chunks.length}]\n`;
-        const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
-        const reply  = header + chunks[i] + footer;
-        const sent   = await typeIntoInput(reply, true);
-        if (!sent) { updateStatus("⚠️ Send failed mid-chunk"); break; }
-        if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
+      const chunks = chunkText(resultText, CHUNK_SIZE);
+      if (chunks.length === 1) {
+        updateStatus("⏳ Injecting result…");
+        bgLog("inject", `💉 Injecting single-chunk result for ${toolName}`, { chars: resultText.length });
+        const reply = `__TOOL_RESULT__\nop: ${toolName}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
+        const sent  = await typeIntoInput(reply, true);
+        updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
+        bgLog(sent ? "success" : "error", sent ? `✅ Inject done` : `❌ Inject failed`, {});
+      } else {
+        bgLog("inject", `📦 Multi-chunk inject: ${chunks.length} chunks for ${toolName}`, { totalChars: resultText.length });
+        for (let i = 0; i < chunks.length; i++) {
+          updateStatus(`⏳ Injecting chunk ${i + 1}/${chunks.length}…`);
+          bgLog("inject", `📦 Injecting chunk ${i + 1}/${chunks.length}`, { chars: chunks[i].length });
+          const isLast = i === chunks.length - 1;
+          const header = i === 0 ? `__TOOL_RESULT__\nop: ${toolName}\n` : `[chunk ${i + 1}/${chunks.length}]\n`;
+          const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
+          const reply  = header + chunks[i] + footer;
+          const sent   = await typeIntoInput(reply, true);
+          if (!sent) { bgLog("error", `❌ Chunk ${i + 1} send failed`, {}); updateStatus("⚠️ Send failed mid-chunk"); break; }
+          if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
+        }
+        updateStatus("✅ Done (chunked)");
       }
-      updateStatus("✅ Done (chunked)");
     }
 
     _busy = false;
@@ -782,7 +839,7 @@
   // ══════════════════════════════════════════════════════════════════════════
   function connectPushChannel() {
     const url = `${PUSH_SSE_URL}?tab=${TAB_ID}`;
-    log("info", "📥 Connecting to push channel", { url, tab: TAB_ID });
+    bgLog("mcp", "📥 Connecting to push channel", { url, tab: TAB_ID });
     let backoff = 1000;
     let es;
     function open() {
@@ -795,7 +852,7 @@
         const submit = payload.submit ?? true;
         const msgId  = payload.id     ?? null;
         if (!text) return;
-        log("info", "📥 Push received", { text: text.slice(0, 80), submit, id: msgId });
+        bgLog("push", "📥 Push message received", { preview: text.slice(0, 80), submit, id: msgId });
         const sent = await typeIntoInput(text, submit);
         try {
           await fetch(PUSH_ACK_URL, {
@@ -806,10 +863,11 @@
         } catch { }
       });
       es.onerror = () => {
+        bgLog("warn", "⚠️ Push channel SSE error — reconnecting", {});
         es.close();
         setTimeout(() => { backoff = Math.min(backoff * 2, 30_000); open(); }, backoff);
       };
-      es.onopen = () => { backoff = 1000; };
+      es.onopen = () => { backoff = 1000; bgLog("mcp", "🟢 Push channel connected", {}); };
     }
     open();
   }
@@ -832,13 +890,18 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 14. TERMINAL PANEL
+  // 14. PANEL — with Background tab, Tool tab, resize, hide/show
   // ══════════════════════════════════════════════════════════════════════════
-  let _panel    = null;
-  let _logCont  = null;
-  let _filter   = "all";
-  let _isFs     = false;
-  let _savedPos = { top:"20px", right:"20px", left:"auto", width:"460px", height:"600px" };
+
+  let _panel        = null;
+  let _logCont      = null;
+  let _bgLogCont    = null;   // background tab content
+  let _toolLogCont  = null;   // tool tab content
+  let _filter       = "all";
+  let _activeTab    = "all";
+  let _isFs         = false;
+  let _isPanelHidden = false;
+  let _savedPos     = { top: "20px", right: "20px", left: "auto", width: "480px", height: "620px" };
 
   const TSTYLE = {
     request: { bg:"#1e1e2e", border:"#89b4fa", hBg:"#89b4fa22", c:"#89b4fa" },
@@ -848,6 +911,17 @@
     info:    { bg:"#1e1e2e", border:"#cba6f7", hBg:"#cba6f722", c:"#cba6f7" },
     user:    { bg:"#1a1a2e", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
     ai:      { bg:"#1a2a1a", border:"#94e2d5", hBg:"#94e2d522", c:"#94e2d5" },
+    // background tab types
+    dom:     { bg:"#1e2a1e", border:"#74c7ec", hBg:"#74c7ec22", c:"#74c7ec" },
+    inject:  { bg:"#1e1e2e", border:"#fab387", hBg:"#fab38722", c:"#fab387" },
+    exec:    { bg:"#2a1e2a", border:"#cba6f7", hBg:"#cba6f722", c:"#cba6f7" },
+    queue:   { bg:"#1e2a2a", border:"#89dceb", hBg:"#89dceb22", c:"#89dceb" },
+    push:    { bg:"#2a2a1e", border:"#f2cdcd", hBg:"#f2cdcd22", c:"#f2cdcd" },
+    mcp:     { bg:"#1e2028", border:"#89b4fa", hBg:"#89b4fa22", c:"#89b4fa" },
+    // tool tab types
+    hit:     { bg:"#1e1e2e", border:"#89b4fa", hBg:"#89b4fa22", c:"#89b4fa" },
+    waiting: { bg:"#2a2310", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
+    received:{ bg:"#1b2b24", border:"#a6e3a1", hBg:"#a6e3a122", c:"#a6e3a1" },
   };
 
   const LLM_STATE_COLORS = {
@@ -865,20 +939,122 @@
     unknown:   "#6c7086",
   };
 
+  // The "All" panel log (original)
+  function log(type, title, data = {}) {
+    _ensurePanel();
+    if (!_logCont) return;
+    _appendLogEntry(_logCont, type, title, data);
+  }
+
+  // Background tab log — everything
+  function bgLog(type, title, data = {}) {
+    _ensurePanel();
+    // Also log to main panel for non-user/ai types
+    if (!["user","ai"].includes(type)) {
+      // map bg types to main panel
+      const mainType = { dom:"info", inject:"info", exec:"info", queue:"info",
+                         push:"info", mcp:"request", hit:"request", waiting:"warn",
+                         received:"success" }[type] || type;
+      log(mainType, title, data);
+    }
+    if (!_bgLogCont) return;
+    _appendLogEntry(_bgLogCont, type, title, data);
+  }
+
+  // Tool tab log — only MCP events
+  function toolLog(type, title, data = {}) {
+    _ensurePanel();
+    if (!_toolLogCont) return;
+    _appendLogEntry(_toolLogCont, type, title, data);
+  }
+
+  function _appendLogEntry(container, type, title, data) {
+    const s = TSTYLE[type] || TSTYLE.info;
+    const body = Object.keys(data).length ? JSON.stringify(data, null, 2) : null;
+    const big = body && body.length > 600;
+    const collapsed = big && ["success","request","received","hit"].includes(type);
+
+    const el = document.createElement("div");
+    el.dataset.lt = type;
+    el.style.cssText = `width:100%;border-radius:6px;background:${s.bg};border:1px solid ${s.border};font-size:11px;overflow:hidden;flex-shrink:0;box-sizing:border-box;`;
+
+    const h = document.createElement("div");
+    h.style.cssText = `padding:5px 10px;background:${s.hBg};color:${s.c};font-weight:bold;display:flex;justify-content:space-between;align-items:center;cursor:${collapsed?"pointer":"default"};`;
+    h.innerHTML = `<span>${title}${collapsed?' <span style="color:#6c7086;font-size:9px">(expand)</span>':""}</span><span style="color:#6c7086;font-size:10px;">${new Date().toLocaleTimeString()}</span>`;
+
+    el.appendChild(h);
+
+    if (body) {
+      const pre = document.createElement("pre");
+      pre.style.cssText = `padding:8px 10px;margin:0;white-space:pre-wrap;word-break:break-all;color:#cdd6f4;background:#11111b55;max-height:280px;overflow-y:auto;display:${collapsed?"none":"block"};font-size:11px;box-sizing:border-box;`;
+      pre.textContent = body;
+      if (collapsed) h.addEventListener("click", () => {
+        const show = pre.style.display === "none";
+        pre.style.display = show ? "block" : "none";
+        const hint = h.querySelector("span span");
+        if (hint) hint.textContent = show ? "(collapse)" : "(expand)";
+      });
+      el.appendChild(pre);
+    }
+
+    container.appendChild(el);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  let _panelInited = false;
+
+  function _ensurePanel() {
+    if (!_panelInited) initPanel();
+  }
+
+  // Toggle button that floats when panel is hidden
+  let _toggleBtn = null;
+
+  function _makeToggleBtn() {
+    _toggleBtn = document.createElement("button");
+    _toggleBtn.id = "vbc-toggle-btn";
+    _toggleBtn.textContent = "VC";
+    _toggleBtn.title = "Show VibesCode Panel";
+    _toggleBtn.style.cssText = [
+      "position:fixed", "bottom:20px", "right:20px",
+      "width:42px", "height:42px", "border-radius:50%",
+      "background:#cba6f7", "color:#1e1e2e",
+      "border:2px solid #89b4fa", "cursor:pointer",
+      "font-size:11px", "font-weight:bold",
+      "font-family:'Consolas','Menlo',monospace",
+      "z-index:999998", "display:none",
+      "box-shadow:0 4px 16px rgba(0,0,0,.5)",
+    ].join(";");
+    _toggleBtn.addEventListener("click", () => {
+      _isPanelHidden = false;
+      _panel.style.display = "flex";
+      _toggleBtn.style.display = "none";
+      bgLog("info", "👁 Panel shown", {});
+    });
+    document.body.appendChild(_toggleBtn);
+  }
+
   function initPanel() {
+    if (_panelInited) return;
+    _panelInited = true;
+
     if (document.getElementById("vbc-panel")) return;
+
+    _makeToggleBtn();
+
     _panel = document.createElement("div");
     _panel.id = "vbc-panel";
     _panel.style.cssText = [
       "position:fixed", `top:${_savedPos.top}`, `right:${_savedPos.right}`,
       `width:${_savedPos.width}`, `height:${_savedPos.height}`,
+      "min-width:300px", "min-height:200px",
       "background:#1e1e2e", "border:2px solid #313244", "border-radius:12px",
       "box-shadow:0 12px 32px rgba(0,0,0,.6)", "display:flex", "flex-direction:column",
       "font-family:'Consolas','Menlo','Monaco',monospace",
       "z-index:999999", "overflow:hidden", "box-sizing:border-box",
     ].join(";");
 
-    // Header
+    // ── Header ──
     const hdr = document.createElement("div");
     hdr.id = "vbc-hdr";
     hdr.style.cssText = "padding:0 12px;height:44px;background:#11111b;color:#cdd6f4;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none;border-bottom:1px solid #313244;flex-shrink:0;";
@@ -889,19 +1065,20 @@
         <span style="color:#a6e3a1;font-size:10px;">⬤</span>
         <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">VibesCode</span>
         <span style="font-size:9px;padding:2px 6px;border-radius:10px;background:#313244;color:#cba6f7;margin-left:4px;">${PLATFORM.name}</span>
-        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v12f</span>
+        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v13+</span>
       </div>
       <div style="display:flex;gap:4px;align-items:center;">
-        <button id="vbc-history-btn" title="Show tool history" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📋</button>
+        <button id="vbc-history-btn" title="Tool history" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📋</button>
         <button id="vbc-tools-btn" title="List MCP tools" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🔧</button>
         <button id="vbc-path-btn" title="Set project path" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📁</button>
         <button id="vbc-shell-btn" title="Run shell command" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">$_</button>
-        <button id="vbc-clear" title="Clear logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🗑</button>
-        <button id="vbc-export" title="Export logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">💾</button>
+        <button id="vbc-clear" title="Clear active tab logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🗑</button>
+        <button id="vbc-export" title="Export logs" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 9px;font-size:10px;cursor:pointer;">💾</button>
         <button id="vbc-fs" title="Fullscreen" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 9px;font-size:10px;cursor:pointer;font-weight:bold;">🗖</button>
+        <button id="vbc-hide" title="Hide panel" style="background:#f38ba822;color:#f38ba8;border:1px solid #f38ba855;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;font-weight:bold;">✕</button>
       </div>`;
 
-    // Rich status bar
+    // ── Status bar ──
     const statusBar = document.createElement("div");
     statusBar.style.cssText = "padding:4px 12px;background:#11111b;border-bottom:1px solid #1e1e2e;font-size:10px;color:#6c7086;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;gap:8px;";
     statusBar.innerHTML = `
@@ -912,7 +1089,7 @@
         <span id="vbc-calls">🔧 0 calls</span>
       </div>`;
 
-    // Quick-input bar (for path / shell)
+    // ── Quick-input bar ──
     const quickBar = document.createElement("div");
     quickBar.id = "vbc-quick-bar";
     quickBar.style.cssText = "padding:6px 10px;background:#11111b;border-bottom:1px solid #1e1e2e;display:none;flex-shrink:0;";
@@ -925,99 +1102,146 @@
         <button id="vbc-quick-close" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 6px;font-size:10px;cursor:pointer;">✕</button>
       </div>`;
 
-    // Tabs
-    const tabs = document.createElement("div");
-    tabs.id = "vbc-tabs";
-    tabs.style.cssText = "display:flex;gap:4px;padding:6px 10px;background:#181825;border-bottom:1px solid #313244;flex-shrink:0;";
-    [["all","All"],["user","👤 User"],["ai","🤖 AI"],["tool","🔧 Tools"]].forEach(([f,l]) => {
+    // ── Tabs ──
+    const tabsBar = document.createElement("div");
+    tabsBar.id = "vbc-tabs";
+    tabsBar.style.cssText = "display:flex;gap:4px;padding:6px 10px;background:#181825;border-bottom:1px solid #313244;flex-shrink:0;overflow-x:auto;";
+
+    const TABS = [
+      ["all",        "All"],
+      ["user",       "👤 User"],
+      ["ai",         "🤖 AI"],
+      ["tool",       "🔧 Tools"],
+      ["background", "⚙️ Background"],
+    ];
+
+    TABS.forEach(([f, l]) => {
       const b = document.createElement("button");
-      b.dataset.f = f;
+      b.dataset.tab = f;
       b.textContent = l;
-      b.style.cssText = "font-size:10px;padding:3px 8px;border-radius:4px;cursor:pointer;border:1px solid #313244;background:transparent;color:#6c7086;";
+      b.style.cssText = "font-size:10px;padding:3px 8px;border-radius:4px;cursor:pointer;border:1px solid #313244;background:transparent;color:#6c7086;white-space:nowrap;flex-shrink:0;";
       if (f === "all") { b.style.borderColor="#89b4fa"; b.style.background="#89b4fa22"; b.style.color="#89b4fa"; }
-      tabs.appendChild(b);
+      tabsBar.appendChild(b);
     });
 
+    // ── Log containers (one per tab that needs its own) ──
+    // Main container = "all", "user", "ai", "tool" (filtered)
     _logCont = document.createElement("div");
-    _logCont.id = "vbc-logs";
+    _logCont.id = "vbc-logs-main";
     _logCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;";
+
+    // Background container
+    _bgLogCont = document.createElement("div");
+    _bgLogCont.id = "vbc-logs-bg";
+    _bgLogCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;display:none;";
+
+    // Tool container
+    _toolLogCont = document.createElement("div");
+    _toolLogCont.id = "vbc-logs-tool";
+    _toolLogCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;display:none;";
 
     _panel.appendChild(hdr);
     _panel.appendChild(statusBar);
     _panel.appendChild(quickBar);
-    _panel.appendChild(tabs);
+    _panel.appendChild(tabsBar);
     _panel.appendChild(_logCont);
+    _panel.appendChild(_bgLogCont);
+    _panel.appendChild(_toolLogCont);
     document.body.appendChild(_panel);
 
     _makeDraggable(_panel, hdr);
+    _makeResizable(_panel);
 
-    // Button handlers
+    // ── Tab switching ──
+    tabsBar.addEventListener("click", e => {
+      const btn = e.target.closest("button[data-tab]");
+      if (!btn) return;
+      _activeTab = btn.dataset.tab;
+
+      tabsBar.querySelectorAll("button[data-tab]").forEach(b => {
+        const active = b === btn;
+        b.style.borderColor = active ? "#89b4fa" : "#313244";
+        b.style.background  = active ? "#89b4fa22" : "transparent";
+        b.style.color       = active ? "#89b4fa" : "#6c7086";
+      });
+
+      // Show correct container
+      _logCont.style.display    = ["all","user","ai"].includes(_activeTab) ? "flex" : "none";
+      _toolLogCont.style.display  = _activeTab === "tool"       ? "flex" : "none";
+      _bgLogCont.style.display  = _activeTab === "background"   ? "flex" : "none";
+
+      if (_activeTab === "all") _applyFilter("all");
+      else if (_activeTab === "user") _applyFilter("user");
+      else if (_activeTab === "ai") _applyFilter("ai");
+    });
+
+    // ── Button handlers ──
     document.getElementById("vbc-fs").addEventListener("click", e => { e.stopPropagation(); _toggleFs(); });
-    document.getElementById("vbc-clear").addEventListener("click", e => { e.stopPropagation(); _logCont.innerHTML = ""; });
+
+    document.getElementById("vbc-hide").addEventListener("click", e => {
+      e.stopPropagation();
+      _isPanelHidden = true;
+      _panel.style.display = "none";
+      _toggleBtn.style.display = "flex";
+      _toggleBtn.style.alignItems = "center";
+      _toggleBtn.style.justifyContent = "center";
+    });
+
+    document.getElementById("vbc-clear").addEventListener("click", e => {
+      e.stopPropagation();
+      if (_activeTab === "background") _bgLogCont.innerHTML = "";
+      else if (_activeTab === "tool") _toolLogCont.innerHTML = "";
+      else _logCont.innerHTML = "";
+    });
+
     document.getElementById("vbc-export").addEventListener("click", e => { e.stopPropagation(); _export(); });
 
-    // History button
     document.getElementById("vbc-history-btn").addEventListener("click", e => {
       e.stopPropagation();
       if (TOOL_HISTORY.length === 0) {
-        log("info", "📋 No tool history yet", {});
+        bgLog("info", "📋 No tool history yet", {});
         return;
       }
       const lines = TOOL_HISTORY.map((h, i) =>
         `#${i + 1} [${new Date(h.time).toLocaleTimeString()}] ${h.tool} (${h.duration}ms) ${h.ok ? "✅" : "❌"}\n  ${h.preview}`
       ).join("\n\n");
-      log("info", `📋 Last ${TOOL_HISTORY.length} tool calls`, { history: lines });
+      bgLog("info", `📋 Last ${TOOL_HISTORY.length} tool calls`, { history: lines });
     });
 
-    // Path button
     document.getElementById("vbc-path-btn").addEventListener("click", e => {
       e.stopPropagation();
-      _showQuickBar("Path:", "Paste project path (e.g. /home/user/myapp)", async (val) => {
+      _showQuickBar("Path:", "Paste project path (e.g. C:/Users/user/myapp)", async (val) => {
         if (!val) return;
-        const result = await McpClient.callTool("detect_root", { hint: val });
-        log("success", "📁 Root set", { result: result.text });
+        const normalizedVal = normalizePath(val);
+        bgLog("dom", `📁 Setting root via panel: ${normalizedVal}`, {});
+        const result = await McpClient.callTool("detect_root", { hint: normalizedVal });
+        bgLog("success", "📁 Root set", { result: result.text });
       });
     });
 
-    // Shell button
     document.getElementById("vbc-shell-btn").addEventListener("click", e => {
       e.stopPropagation();
       _showQuickBar("$ Shell:", "Enter shell command…", async (val) => {
         if (!val) return;
-        log("info", `🖥 Running: ${val}`, {});
+        bgLog("exec", `🖥 Shell command from panel: ${val}`, {});
         const result = await McpClient.callTool("shell", { cmd: val });
-        log(result.ok ? "success" : "error", `$ ${val}`, { output: result.text });
+        bgLog(result.ok ? "success" : "error", `$ ${val}`, { output: result.text });
       });
     });
 
-    // Tools list button
     document.getElementById("vbc-tools-btn").addEventListener("click", async e => {
       e.stopPropagation();
       try {
         const resp = await fetch(`${MCP_BASE_URL}/tools`);
         const data = await resp.json();
         const lines = (data.tools || []).map(t => `• ${t.name}: ${t.description}`).join("\n");
-        log("info", `🔧 ${data.total} tools registered`, { tools: lines });
+        bgLog("info", `🔧 ${data.total} tools registered`, { tools: lines });
       } catch (err) {
-        log("error", "❌ Could not fetch tools", { error: err.message });
+        bgLog("error", "❌ Could not fetch tools", { error: err.message });
       }
     });
 
-    // Tab filter
-    tabs.addEventListener("click", e => {
-      const btn = e.target.closest("button[data-f]");
-      if (!btn) return;
-      _filter = btn.dataset.f;
-      tabs.querySelectorAll("button[data-f]").forEach(b => {
-        const active = b === btn;
-        b.style.borderColor = active ? "#89b4fa" : "#313244";
-        b.style.background  = active ? "#89b4fa22" : "transparent";
-        b.style.color       = active ? "#89b4fa" : "#6c7086";
-      });
-      _applyFilter(_filter);
-    });
-
-    // Quick bar run/close
+    // Quick bar
     document.getElementById("vbc-quick-run").addEventListener("click", async () => {
       const val = document.getElementById("vbc-quick-input").value.trim();
       if (_quickCallback) await _quickCallback(val);
@@ -1056,13 +1280,13 @@
   }
 
   function _applyFilter(f) {
+    if (!_logCont) return;
     _logCont.querySelectorAll("[data-lt]").forEach(el => {
       const t = el.dataset.lt;
       el.style.display = (
         f === "all" ||
         (f === "user" && t === "user") ||
-        (f === "ai"   && t === "ai") ||
-        (f === "tool" && ["request","success","error","warn"].includes(t))
+        (f === "ai"   && t === "ai")
       ) ? "" : "none";
     });
   }
@@ -1074,50 +1298,11 @@
   function updateStatusBar(llmState, btnStatus) {
     const llmEl = document.getElementById("vbc-llm-state");
     const btnEl = document.getElementById("vbc-btn-state");
-    if (llmEl) {
-      llmEl.textContent = `LLM: ${llmState}`;
-      llmEl.style.color = LLM_STATE_COLORS[llmState] || "#6c7086";
-    }
-    if (btnEl) {
-      btnEl.textContent = `BTN: ${btnStatus}`;
-      btnEl.style.color = BTN_STATE_COLORS[btnStatus] || "#6c7086";
-    }
+    if (llmEl) { llmEl.textContent = `LLM: ${llmState}`; llmEl.style.color = LLM_STATE_COLORS[llmState] || "#6c7086"; }
+    if (btnEl) { btnEl.textContent = `BTN: ${btnStatus}`; btnEl.style.color = BTN_STATE_COLORS[btnStatus] || "#6c7086"; }
   }
 
-  function log(type, title, data = {}) {
-    initPanel();
-    if (!_logCont) return;
-    const s = TSTYLE[type] || TSTYLE.info;
-    const body = JSON.stringify(data, null, 2);
-    const big = body.length > 600;
-    const collapsed = big && ["success","request"].includes(type);
-
-    const el = document.createElement("div");
-    el.dataset.lt = type;
-    el.style.cssText = `width:100%;border-radius:6px;background:${s.bg};border:1px solid ${s.border};font-size:11px;overflow:hidden;flex-shrink:0;`;
-
-    const h = document.createElement("div");
-    h.style.cssText = `padding:5px 10px;background:${s.hBg};color:${s.c};font-weight:bold;display:flex;justify-content:space-between;align-items:center;cursor:${collapsed?"pointer":"default"};`;
-    h.innerHTML = `<span>${title}${collapsed?' <span style="color:#6c7086;font-size:9px">(expand)</span>':""}</span><span style="color:#6c7086;font-size:10px;">${new Date().toLocaleTimeString()}</span>`;
-
-    const pre = document.createElement("pre");
-    pre.style.cssText = `padding:8px 10px;margin:0;white-space:pre-wrap;word-break:break-all;color:#cdd6f4;background:#11111b55;max-height:280px;overflow-y:auto;display:${collapsed?"none":"block"};font-size:11px;`;
-    pre.textContent = body;
-
-    if (collapsed) h.addEventListener("click", () => {
-      const show = pre.style.display === "none";
-      pre.style.display = show ? "block" : "none";
-      const hint = h.querySelector("span span");
-      if (hint) hint.textContent = show ? "(collapse)" : "(expand)";
-    });
-
-    el.appendChild(h);
-    el.appendChild(pre);
-    _logCont.appendChild(el);
-    _logCont.scrollTop = _logCont.scrollHeight;
-    if (_filter !== "all") _applyFilter(_filter);
-  }
-
+  // ── Draggable ──
   function _makeDraggable(el, handle) {
     let drag=false, sx, sy, sl, st, raf;
     handle.addEventListener("mousedown", e => {
@@ -1128,8 +1313,7 @@
       e.preventDefault();
     });
     document.addEventListener("mousemove", e => {
-      if (!drag) return;
-      if (raf) return;
+      if (!drag || raf) return;
       raf=requestAnimationFrame(() => {
         raf=null; if (!drag) return;
         const l=Math.max(0,Math.min(sl+e.clientX-sx,innerWidth-el.offsetWidth));
@@ -1138,6 +1322,69 @@
       });
     });
     document.addEventListener("mouseup", () => { drag=false; });
+  }
+
+  // ── Resizable — 8-direction handles ──
+  function _makeResizable(el) {
+    const EDGE = 8; // px hitzone
+    let resizing = false;
+    let dir = "";
+    let startX, startY, startW, startH, startL, startT;
+
+    const getCursor = (d) => ({
+      n:"ns-resize", s:"ns-resize", e:"ew-resize", w:"ew-resize",
+      ne:"nesw-resize", nw:"nwse-resize", se:"nwse-resize", sw:"nesw-resize",
+    }[d] || "default");
+
+    el.addEventListener("mousemove", e => {
+      if (resizing || _isFs) return;
+      const r = el.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const y = e.clientY - r.top;
+      const w = r.width, h = r.height;
+      const onN = y < EDGE, onS = y > h - EDGE;
+      const onW = x < EDGE, onE = x > w - EDGE;
+      let d = "";
+      if (onN && onW) d="nw"; else if (onN && onE) d="ne";
+      else if (onS && onW) d="sw"; else if (onS && onE) d="se";
+      else if (onN) d="n"; else if (onS) d="s";
+      else if (onW) d="w"; else if (onE) d="e";
+      el.style.cursor = d ? getCursor(d) : "";
+      dir = d;
+    });
+
+    el.addEventListener("mousedown", e => {
+      if (!dir || _isFs) return;
+      e.preventDefault();
+      e.stopPropagation();
+      resizing = true;
+      startX = e.clientX; startY = e.clientY;
+      const r = el.getBoundingClientRect();
+      startW = r.width; startH = r.height;
+      startL = r.left;  startT = r.top;
+      el.style.right = "auto";
+    });
+
+    document.addEventListener("mousemove", e => {
+      if (!resizing) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      const MIN_W = 300, MIN_H = 200;
+      if (dir.includes("e")) el.style.width  = Math.max(MIN_W, startW + dx) + "px";
+      if (dir.includes("s")) el.style.height = Math.max(MIN_H, startH + dy) + "px";
+      if (dir.includes("w")) {
+        const nw = Math.max(MIN_W, startW - dx);
+        el.style.width = nw + "px";
+        el.style.left  = (startL + startW - nw) + "px";
+      }
+      if (dir.includes("n")) {
+        const nh = Math.max(MIN_H, startH - dy);
+        el.style.height = nh + "px";
+        el.style.top    = (startT + startH - nh) + "px";
+      }
+    });
+
+    document.addEventListener("mouseup", () => { resizing = false; });
   }
 
   function _toggleFs() {
@@ -1154,12 +1401,16 @@
 
   function _export() {
     const rows=[];
-    _logCont.querySelectorAll("[data-lt]").forEach(el => {
-      rows.push({
-        type:  el.dataset.lt,
-        title: el.querySelector("span")?.textContent?.trim(),
-        data:  (() => { try { return JSON.parse(el.querySelector("pre")?.textContent||"{}"); } catch { return {}; } })(),
-        time:  el.querySelector("[style*='font-size:10px']")?.textContent,
+    [_logCont, _bgLogCont, _toolLogCont].forEach(cont => {
+      if (!cont) return;
+      cont.querySelectorAll("[data-lt]").forEach(el => {
+        rows.push({
+          tab:   cont.id,
+          type:  el.dataset.lt,
+          title: el.querySelector("span")?.textContent?.trim(),
+          data:  (() => { try { return JSON.parse(el.querySelector("pre")?.textContent||"{}"); } catch { return {}; } })(),
+          time:  el.querySelector("[style*='font-size:10px']")?.textContent,
+        });
       });
     });
     const url = URL.createObjectURL(new Blob([JSON.stringify(rows,null,2)],{type:"application/json"}));
@@ -1171,23 +1422,24 @@
   // 15. BOOT
   // ══════════════════════════════════════════════════════════════════════════
   initPanel();
-  log("info", "🚀 VibesCode v12-final (MCP)", { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
+  bgLog("info", `🚀 VibesCode v13+ booting`, { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
 
   McpClient.connect();
   connectPushChannel();
   startHeartbeat();
 
-  // Auto root detection on boot (3s delay to let MCP settle)
+  // Auto root detection on boot
   setTimeout(async () => {
+    bgLog("dom", "🔍 Auto-detecting project root from page URL...", { url: location.href });
     try {
       const result = await McpClient.callTool("detect_root", { hint: location.href });
-      log("success", "📁 Auto root detected", { result: result.text });
-    } catch {
-      // Non-critical — server will use its default root
+      bgLog("success", "📁 Auto root detection result", { result: result.text });
+    } catch (err) {
+      bgLog("warn", "⚠️ Auto root detection skipped", { reason: err.message });
     }
   }, 3000);
 
-  // Debounced MutationObserver — prevents CPU overload during streaming
+  // Debounced MutationObserver
   setTimeout(() => {
     const root = getChatRoot();
     let SCAN_TIMER = null;
@@ -1198,7 +1450,7 @@
         scanAiMessages();
       }, 250);
     }).observe(root, { childList: true, subtree: true, characterData: true });
-    log("info", "👁 Watching DOM", { root: root.tagName || root.nodeName });
+    bgLog("dom", "👁 DOM MutationObserver attached", { rootTag: root.tagName || root.nodeName });
   }, 800);
 
   // SPA navigation reset
@@ -1207,9 +1459,9 @@
     if (location.pathname !== _lastPath) {
       _lastPath = location.pathname;
       _seenTexts.clear();
-      log("info", "🔄 SPA navigation", { path: location.pathname });
+      bgLog("info", "🔄 SPA navigation detected", { path: location.pathname });
     }
   }, 1_000);
 
-  console.log("[VibesCode v12-final] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
+  console.log("[VibesCode v13+] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
 })();

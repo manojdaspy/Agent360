@@ -1,47 +1,47 @@
 {
   "manifest_version": 3,
-  "name": "LuckeyVibesCode",
-  "version": "1.0.0",
-  "description": "Connects AI chat to your Django project via HTTP tools",
-
+  "name": "VibesCode Agent v12",
+  "version": "12.0.0",
+  "description": "AI DOM bridge + MCP agent",
   "permissions": [
-    "activeTab",
     "storage",
-    "scripting"
+    "activeTab",
+    "scripting",
+    "tabs",
+    "clipboardRead",
+    "clipboardWrite"
   ],
-
   "host_permissions": [
-    "https://*/*",
-    "http://localhost/*",
-    "http://127.0.0.1/*"
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://perplexity.ai/*",
+    "https://studentassignment.lyralogics.com/*"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "content_scripts": [
     {
       "matches": [
-        "https://claude.ai/*",
         "https://chat.openai.com/*",
         "https://chatgpt.com/*",
+        "https://claude.ai/*",
         "https://gemini.google.com/*",
-        "https://www.perplexity.ai/*",
-        "http://localhost:*/*",
-        "http://127.0.0.1:*/*"
+        "https://perplexity.ai/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
   ],
-
-  "action": {
-    "default_popup": "popup.html",
-    "default_icon": {
-      "16":  "icons/icon16.png",
-      "48":  "icons/icon48.png",
-      "128": "icons/icon128.png"
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["<all_urls>"]
     }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src *"
   }
 }

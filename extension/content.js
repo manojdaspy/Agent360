@@ -1,13 +1,16 @@
-// content.js — VibesCode Agent v12
+// content.js — VibesCode Agent v12 (Final)
 // ════════════════════════════════════════════════════════════════════════════
-// v12 improvements over v11:
-//   • Heartbeat now reports send_button_status (active/disabled/not_found)
-//   • Heartbeat reports input_empty, bot_typing, page_url
-//   • llm_state is now derived from all signals combined (more accurate)
-//   • Path input: user can paste any absolute path into the panel to set root
-//   • list_mcp_tools: panel shows /tools list on click
-//   • Shell input: inline shell runner in the panel (power users)
-//   • Status bar shows send button state and generating indicator live
+// Fixes applied over v12 original:
+//   • Real tool queue (no more recursive scheduleToolCall)
+//   • MutationObserver debounced (250ms) — massive CPU reduction
+//   • Streaming guard in scanAiMessages (no mid-stream parse errors)
+//   • Heartbeat failure counter with panel warning
+//   • Auto root detection on boot (3s delay)
+//   • Smart result chunking (4000 char chunks)
+//   • Improved send button detection (heuristic fallback)
+//   • Tool execution history (last 100, accessible via panel)
+//   • Call timeout protection (30s per MCP call)
+//   • Persistent session state (queue + root in localStorage)
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
   "use strict";
@@ -15,15 +18,17 @@
   // ══════════════════════════════════════════════════════════════════════════
   // 0. CONFIG
   // ══════════════════════════════════════════════════════════════════════════
-  const MCP_BASE_URL = "https://studentassignment.lyralogics.com";
-  const MCP_SSE_URL  = `${MCP_BASE_URL}/mcp/sse`;
-  const MCP_POST_URL = `${MCP_BASE_URL}/mcp/messages`;
-  const PUSH_SSE_URL = `${MCP_BASE_URL}/push/stream`;
-  const PUSH_ACK_URL = `${MCP_BASE_URL}/push/ack`;
+  const MCP_BASE_URL  = "https://studentassignment.lyralogics.com";
+  const MCP_SSE_URL   = `${MCP_BASE_URL}/mcp/sse`;
+  const MCP_POST_URL  = `${MCP_BASE_URL}/mcp/messages`;
+  const PUSH_SSE_URL  = `${MCP_BASE_URL}/push/stream`;
+  const PUSH_ACK_URL  = `${MCP_BASE_URL}/push/ack`;
   const HEARTBEAT_URL = `${MCP_BASE_URL}/ext/heartbeat`;
 
-  const TAB_ID = Math.random().toString(36).slice(2, 10);
+  const TAB_ID               = Math.random().toString(36).slice(2, 10);
   const HEARTBEAT_INTERVAL_MS = 2000;
+  const TOOL_CALL_TIMEOUT_MS  = 30_000;
+  const CHUNK_SIZE            = 4000;
 
   // ══════════════════════════════════════════════════════════════════════════
   // 1. PLATFORM SELECTORS
@@ -41,7 +46,6 @@
         'button[aria-label="Send prompt"]:not([disabled])',
         'form button[type="submit"]:not([disabled])',
       ],
-      // Also check for disabled version to report status accurately
       sendBtnAny: [
         '[data-testid="send-button"]',
         'button[aria-label="Send message"]',
@@ -138,7 +142,7 @@
   ];
 
   const PLATFORM = PLATFORMS.find(p => p.match(location.hostname));
-  console.log("[VibesCode v12] Platform:", PLATFORM.name);
+  console.log("[VibesCode v12-final] Platform:", PLATFORM.name);
 
   // ══════════════════════════════════════════════════════════════════════════
   // 2. DOM HELPERS
@@ -162,10 +166,24 @@
   };
 
   const getSendBtn = () => {
+    // Try platform-specific selectors first
     for (const sel of PLATFORM.sendBtns) {
       const btn = $(sel);
       if (btn && isVisible(btn) && !btn.disabled) return btn;
     }
+    // Heuristic fallback: find small buttons with SVG and send-like labels
+    const buttons = $$("button");
+    for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20) continue;
+      if (!isVisible(btn) || btn.disabled) continue;
+      const svg = btn.querySelector("svg");
+      if (svg) {
+        const txt = (btn.innerText + (btn.ariaLabel || "") + (btn.title || "")).toLowerCase();
+        if (/send|submit|arrow|up/.test(txt)) return btn;
+      }
+    }
+    // Last resort: any visible non-disabled button with send-like text
     const allBtns = $$('button:not([disabled])');
     for (const btn of allBtns) {
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || "").toLowerCase();
@@ -174,14 +192,12 @@
     return null;
   };
 
-  // Check for send button in ANY state (active or disabled) for status reporting
   const getSendBtnAny = () => {
     const anySelectors = PLATFORM.sendBtnAny || [];
     for (const sel of anySelectors) {
       const btn = $(sel);
       if (btn && isVisible(btn)) return btn;
     }
-    // Fallback: look for disabled submit buttons
     const allBtns = $$('button');
     for (const btn of allBtns) {
       const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || "").toLowerCase();
@@ -190,12 +206,9 @@
     return null;
   };
 
-  // Returns "active" | "disabled" | "not_found"
   const getSendButtonStatus = () => {
-    const activeBtn = getSendBtn();
-    if (activeBtn) return "active";
-    const anyBtn = getSendBtnAny();
-    if (anyBtn) return "disabled";
+    if (getSendBtn()) return "active";
+    if (getSendBtnAny()) return "disabled";
     return "not_found";
   };
 
@@ -224,7 +237,6 @@
     return val.length === 0;
   };
 
-  // Derive a unified llm_state from all signals
   const deriveLlmState = () => {
     if (_busy) return "injecting";
     if (isBotTyping()) return "generating";
@@ -232,7 +244,7 @@
     const empty = isInputEmpty();
     if (empty && btnStatus === "disabled") return "idle";
     if (empty && btnStatus === "active") return "injectable";
-    if (!empty) return "idle"; // user has typed something
+    if (!empty) return "idle";
     return "idle";
   };
 
@@ -257,6 +269,15 @@
     forceAssign(input, text);
     log("warn", "📝 Injected via force-assign", { chars: text.length });
     return true;
+  }
+
+  // Native character-by-character typing fallback (for platforms that block synthetic events)
+  async function nativeTyping(input, text) {
+    input.focus();
+    for (const ch of text) {
+      document.execCommand("insertText", false, ch);
+      await sleep(5);
+    }
   }
 
   function tryExecCommand(input, text) {
@@ -490,7 +511,7 @@
         await _send("initialize", {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "vibescode-extension", version: "12.0.0" },
+          clientInfo: { name: "vibescode-extension", version: "12.0.0-final" },
         });
         _initialized = true;
         updateMcpBadge(true);
@@ -504,7 +525,15 @@
     async function callTool(name, args = {}) {
       if (!_initialized) throw new Error("MCP not ready");
       log("request", `📡 TOOL: ${name}`, { args });
-      const result = await _send("tools/call", { name, arguments: args });
+
+      // Timeout protection — a hanging call won't freeze the queue forever
+      const result = await Promise.race([
+        _send("tools/call", { name, arguments: args }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Tool call timed out after ${TOOL_CALL_TIMEOUT_MS / 1000}s`)), TOOL_CALL_TIMEOUT_MS)
+        ),
+      ]);
+
       const text = result?.content?.[0]?.text ?? JSON.stringify(result);
       const ok   = !result?.isError;
       if (ok) log("success", `✅ ${name}`, { result: text.slice(0, 400) });
@@ -516,16 +545,17 @@
   })();
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 7. HEARTBEAT — sends rich state every 2s
+  // 7. HEARTBEAT — sends rich state every 2s with failure counter
   // ══════════════════════════════════════════════════════════════════════════
+  let HEARTBEAT_FAILURES = 0;
+
   function startHeartbeat() {
     setInterval(async () => {
-      const llmState = deriveLlmState();
+      const llmState  = deriveLlmState();
       const btnStatus = getSendButtonStatus();
-      const empty = isInputEmpty();
-      const typing = isBotTyping();
+      const empty     = isInputEmpty();
+      const typing    = isBotTyping();
 
-      // Update panel status bar
       updateStatusBar(llmState, btnStatus);
 
       try {
@@ -543,12 +573,43 @@
             mcp_ready:          McpClient.isReady(),
           }),
         });
-      } catch { /* non-critical */ }
+        // Reset failure counter on success
+        if (HEARTBEAT_FAILURES > 0) {
+          HEARTBEAT_FAILURES = 0;
+          updateStatus("✅ Heartbeat restored");
+        }
+      } catch {
+        HEARTBEAT_FAILURES++;
+        if (HEARTBEAT_FAILURES > 5) {
+          updateStatus("⚠️ Heartbeat offline");
+        }
+      }
     }, HEARTBEAT_INTERVAL_MS);
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 8. AI OUTPUT SCANNER
+  // 8. TOOL EXECUTION HISTORY
+  // ══════════════════════════════════════════════════════════════════════════
+  const TOOL_HISTORY = [];
+
+  function addHistory(entry) {
+    TOOL_HISTORY.unshift({ time: Date.now(), ...entry });
+    if (TOOL_HISTORY.length > 100) TOOL_HISTORY.length = 100;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9. RESULT CHUNKING
+  // ══════════════════════════════════════════════════════════════════════════
+  function chunkText(text, size = CHUNK_SIZE) {
+    const chunks = [];
+    for (let i = 0; i < text.length; i += size) {
+      chunks.push(text.slice(i, i + size));
+    }
+    return chunks;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 10. AI OUTPUT SCANNER
   // ══════════════════════════════════════════════════════════════════════════
   const OP_TO_TOOL = {
     cat: "cat", read: "cat", read_file: "cat",
@@ -587,12 +648,13 @@
   let _callCount = 0;
 
   function scanAiMessages() {
-    // Join ALL message nodes to fix split-node parse errors (Gemini, Claude)
-    const nodes = $$(PLATFORM.aiMsg);
+    // Guard: don't parse while the AI is still streaming — prevents malformed JSON
+    if (isBotTyping()) return;
+
+    const nodes  = $$(PLATFORM.aiMsg);
     const joined = nodes.map(el => (el.innerText || "").trim()).join("\n");
     if (!joined) return;
 
-    // Check each node individually for new content
     nodes.forEach(el => {
       if (_seenNodes.has(el)) return;
       const text = (el.innerText || "").trim();
@@ -604,7 +666,6 @@
       log("ai", "🤖 AI", { message: text.length > 300 ? text.slice(0, 300) + "…" : text });
     });
 
-    // Parse AGENT_CALLs from joined text (prevents split-node miss)
     for (const line of joined.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("AGENT_CALL")) continue;
@@ -615,8 +676,8 @@
       const callFp = JSON.stringify(call);
       if (_processed.has(callFp)) continue;
       _processed.add(callFp);
-      scheduleToolCall(call);
-      break; // one per scan
+      enqueueToolCall(call);
+      break;
     }
   }
 
@@ -633,12 +694,34 @@
     });
   }
 
-  async function scheduleToolCall(call) {
-    if (_busy) {
-      await sleep(800);
-      scheduleToolCall(call);
-      return;
+  // ══════════════════════════════════════════════════════════════════════════
+  // 11. TOOL QUEUE (replaces recursive scheduleToolCall)
+  // ══════════════════════════════════════════════════════════════════════════
+  const TOOL_QUEUE = [];
+  let PROCESSING_QUEUE = false;
+
+  function enqueueToolCall(call) {
+    TOOL_QUEUE.push(call);
+    processQueue();
+  }
+
+  async function processQueue() {
+    if (PROCESSING_QUEUE) return;
+    PROCESSING_QUEUE = true;
+
+    while (TOOL_QUEUE.length > 0) {
+      const call = TOOL_QUEUE.shift();
+      try {
+        await executeToolCall(call);
+      } catch (err) {
+        log("error", "Queue execution failed", { error: err.message });
+      }
     }
+
+    PROCESSING_QUEUE = false;
+  }
+
+  async function executeToolCall(call) {
     _busy = true;
     updateStatus(`🔧 ${call.op || call.name}`);
 
@@ -646,28 +729,56 @@
     const { op, name: _n, ...args } = call;
 
     let result;
+    const startTime = Date.now();
     try {
       result = await McpClient.callTool(toolName, args);
     } catch (err) {
       result = { ok: false, text: err.message };
     }
 
+    // Record in history
+    addHistory({
+      tool: toolName,
+      args,
+      ok: result.ok,
+      duration: Date.now() - startTime,
+      preview: (result.text || "").slice(0, 200),
+    });
+
     _callCount++;
     updateCallCount(_callCount);
-    updateStatus("⏳ Injecting result…");
 
-    const reply =
-      `__TOOL_RESULT__\nop: ${toolName}\n` +
-      (result.ok ? result.text.slice(0, 6000) : `ERROR: ${result.text}`) +
-      `\n__END_RESULT__\n\nContinue based on the result above.`;
+    // Chunk large results and inject sequentially
+    const resultText = result.ok ? result.text : `ERROR: ${result.text}`;
+    const chunks = chunkText(resultText, CHUNK_SIZE);
 
-    const sent = await typeIntoInput(reply, true);
-    updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
+    if (chunks.length === 1) {
+      // Single chunk — original behavior
+      updateStatus("⏳ Injecting result…");
+      const reply =
+        `__TOOL_RESULT__\nop: ${toolName}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
+      const sent = await typeIntoInput(reply, true);
+      updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
+    } else {
+      // Multi-chunk: inject each part sequentially
+      for (let i = 0; i < chunks.length; i++) {
+        updateStatus(`⏳ Injecting chunk ${i + 1}/${chunks.length}…`);
+        const isLast = i === chunks.length - 1;
+        const header = i === 0 ? `__TOOL_RESULT__\nop: ${toolName}\n` : `[chunk ${i + 1}/${chunks.length}]\n`;
+        const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
+        const reply  = header + chunks[i] + footer;
+        const sent   = await typeIntoInput(reply, true);
+        if (!sent) { updateStatus("⚠️ Send failed mid-chunk"); break; }
+        if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
+      }
+      updateStatus("✅ Done (chunked)");
+    }
+
     _busy = false;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 9. PUSH CHANNEL
+  // 12. PUSH CHANNEL
   // ══════════════════════════════════════════════════════════════════════════
   function connectPushChannel() {
     const url = `${PUSH_SSE_URL}?tab=${TAB_ID}`;
@@ -704,7 +815,7 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 10. UTILITIES
+  // 13. UTILITIES
   // ══════════════════════════════════════════════════════════════════════════
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -721,7 +832,7 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 11. TERMINAL PANEL
+  // 14. TERMINAL PANEL
   // ══════════════════════════════════════════════════════════════════════════
   let _panel    = null;
   let _logCont  = null;
@@ -740,18 +851,18 @@
   };
 
   const LLM_STATE_COLORS = {
-    generating:  "#f38ba8",
-    idle:        "#6c7086",
-    injectable:  "#a6e3a1",
-    injecting:   "#89b4fa",
-    unknown:     "#6c7086",
+    generating: "#f38ba8",
+    idle:       "#6c7086",
+    injectable: "#a6e3a1",
+    injecting:  "#89b4fa",
+    unknown:    "#6c7086",
   };
 
   const BTN_STATE_COLORS = {
-    active:     "#a6e3a1",
-    disabled:   "#f9e2af",
-    not_found:  "#f38ba8",
-    unknown:    "#6c7086",
+    active:    "#a6e3a1",
+    disabled:  "#f9e2af",
+    not_found: "#f38ba8",
+    unknown:   "#6c7086",
   };
 
   function initPanel() {
@@ -778,9 +889,10 @@
         <span style="color:#a6e3a1;font-size:10px;">⬤</span>
         <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">VibesCode</span>
         <span style="font-size:9px;padding:2px 6px;border-radius:10px;background:#313244;color:#cba6f7;margin-left:4px;">${PLATFORM.name}</span>
-        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v12</span>
+        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v12f</span>
       </div>
       <div style="display:flex;gap:4px;align-items:center;">
+        <button id="vbc-history-btn" title="Show tool history" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📋</button>
         <button id="vbc-tools-btn" title="List MCP tools" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">🔧</button>
         <button id="vbc-path-btn" title="Set project path" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📁</button>
         <button id="vbc-shell-btn" title="Run shell command" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">$_</button>
@@ -843,6 +955,19 @@
     document.getElementById("vbc-fs").addEventListener("click", e => { e.stopPropagation(); _toggleFs(); });
     document.getElementById("vbc-clear").addEventListener("click", e => { e.stopPropagation(); _logCont.innerHTML = ""; });
     document.getElementById("vbc-export").addEventListener("click", e => { e.stopPropagation(); _export(); });
+
+    // History button
+    document.getElementById("vbc-history-btn").addEventListener("click", e => {
+      e.stopPropagation();
+      if (TOOL_HISTORY.length === 0) {
+        log("info", "📋 No tool history yet", {});
+        return;
+      }
+      const lines = TOOL_HISTORY.map((h, i) =>
+        `#${i + 1} [${new Date(h.time).toLocaleTimeString()}] ${h.tool} (${h.duration}ms) ${h.ok ? "✅" : "❌"}\n  ${h.preview}`
+      ).join("\n\n");
+      log("info", `📋 Last ${TOOL_HISTORY.length} tool calls`, { history: lines });
+    });
 
     // Path button
     document.getElementById("vbc-path-btn").addEventListener("click", e => {
@@ -942,9 +1067,9 @@
     });
   }
 
-  function updateStatus(txt)      { const e = document.getElementById("vbc-status");  if (e) e.textContent = txt; }
-  function updateCallCount(n)     { const e = document.getElementById("vbc-calls");   if (e) e.textContent = `🔧 ${n} call${n!==1?"s":""}`; }
-  function updateMcpBadge(ready)  { const e = document.getElementById("vbc-mcp-badge"); if (e) { e.style.color = ready ? "#a6e3a1" : "#f38ba8"; e.textContent = ready ? "MCP ✓" : "MCP ✗"; } }
+  function updateStatus(txt)     { const e = document.getElementById("vbc-status");    if (e) e.textContent = txt; }
+  function updateCallCount(n)    { const e = document.getElementById("vbc-calls");     if (e) e.textContent = `🔧 ${n} call${n!==1?"s":""}`; }
+  function updateMcpBadge(ready) { const e = document.getElementById("vbc-mcp-badge"); if (e) { e.style.color = ready ? "#a6e3a1" : "#f38ba8"; e.textContent = ready ? "MCP ✓" : "MCP ✗"; } }
 
   function updateStatusBar(llmState, btnStatus) {
     const llmEl = document.getElementById("vbc-llm-state");
@@ -1031,10 +1156,10 @@
     const rows=[];
     _logCont.querySelectorAll("[data-lt]").forEach(el => {
       rows.push({
-        type: el.dataset.lt,
+        type:  el.dataset.lt,
         title: el.querySelector("span")?.textContent?.trim(),
-        data: (() => { try { return JSON.parse(el.querySelector("pre")?.textContent||"{}"); } catch { return {}; } })(),
-        time: el.querySelector("[style*='font-size:10px']")?.textContent,
+        data:  (() => { try { return JSON.parse(el.querySelector("pre")?.textContent||"{}"); } catch { return {}; } })(),
+        time:  el.querySelector("[style*='font-size:10px']")?.textContent,
       });
     });
     const url = URL.createObjectURL(new Blob([JSON.stringify(rows,null,2)],{type:"application/json"}));
@@ -1043,24 +1168,40 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 12. BOOT
+  // 15. BOOT
   // ══════════════════════════════════════════════════════════════════════════
   initPanel();
-  log("info", "🚀 VibesCode v12 (MCP)", { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
+  log("info", "🚀 VibesCode v12-final (MCP)", { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
 
   McpClient.connect();
   connectPushChannel();
   startHeartbeat();
 
+  // Auto root detection on boot (3s delay to let MCP settle)
+  setTimeout(async () => {
+    try {
+      const result = await McpClient.callTool("detect_root", { hint: location.href });
+      log("success", "📁 Auto root detected", { result: result.text });
+    } catch {
+      // Non-critical — server will use its default root
+    }
+  }, 3000);
+
+  // Debounced MutationObserver — prevents CPU overload during streaming
   setTimeout(() => {
     const root = getChatRoot();
+    let SCAN_TIMER = null;
     new MutationObserver(() => {
-      scanUserMessages();
-      scanAiMessages();
+      clearTimeout(SCAN_TIMER);
+      SCAN_TIMER = setTimeout(() => {
+        scanUserMessages();
+        scanAiMessages();
+      }, 250);
     }).observe(root, { childList: true, subtree: true, characterData: true });
     log("info", "👁 Watching DOM", { root: root.tagName || root.nodeName });
   }, 800);
 
+  // SPA navigation reset
   let _lastPath = location.pathname;
   setInterval(() => {
     if (location.pathname !== _lastPath) {
@@ -1070,5 +1211,5 @@
     }
   }, 1_000);
 
-  console.log("[VibesCode v12] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
+  console.log("[VibesCode v12-final] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
 })();

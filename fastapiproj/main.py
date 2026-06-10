@@ -340,8 +340,14 @@ async def list_mcp_tools() -> str:
     lines = ["Available MCP tools:\n"]
     for t in tools:
         name = getattr(t, "name", str(t))
-        desc = getattr(t, "description", "") or getattr(t, "__doc__", "")
-        lines.append(f"  • {name}: {desc.splitlines()[0][:120]}")
+        raw_desc = getattr(t, "description", "") or getattr(t, "__doc__", "")
+        desc = raw_desc if raw_desc is not None else ""
+        
+        # Safe splitlines extraction
+        split_lines = desc.splitlines()
+        first_line = split_lines[0][:120] if split_lines else "No description provided."
+        
+        lines.append(f"  • {name}: {first_line}")
 
     return "\n".join(lines)
 # ── File & directory tools ─────────────────────────────────────────────────────

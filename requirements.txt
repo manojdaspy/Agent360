@@ -19,3 +19,5 @@ pytest>=8.0
 pytest-django>=4.8
 pytest-httpx>=0.30
 factory-boy>=3.3
+
+django-mcp-server

@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "VibesCode Agent",
+  "name": "LuckeyVibesCode",
   "version": "1.0.0",
   "description": "Connects AI chat to your Django project via HTTP tools",
 

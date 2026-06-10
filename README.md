@@ -1,520 +1,197 @@
-# VibesCode Agent
+# VibesCode v9 — Architecture & Setup Guide
 
-> **An LLM-powered Django project assistant. The human types, the LLM thinks, the Django server acts — over plain HTTP.**
-
----
-
-## The Big Picture
+## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         THE FULL FLOW                               │
-│                                                                     │
-│  Human types: "Fix the NameError in mainapp/views.py"               │
-│       │                                                             │
-│       ▼                                                             │
-│  ┌─────────────┐   any of these clients:                            │
-│  │   Cline     │──┐  VSCode extension, OpenAI-compatible            │
-│  │  Continue   │──┤  VSCode/JetBrains plugin                        │
-│  │   Cursor    │──┤  IDE with custom API mode                       │
-│  │   Aider     │──┤  terminal tool, --openai-api-base flag          │
-│  │  Your UI    │──┤  any frontend hitting the REST API              │
-│  │  CLI        │──┘  python manage.py vibescode "..."               │
-│  └─────────────┘                                                    │
-│          │                                                          │
-│          │  HTTP/HTTPS  (OpenAI, MCP, or REST format)              │
-│          ▼                                                          │
-│  ┌───────────────────────────────────────────────────────────┐      │
-│  │              YOUR DJANGO SERVER (this app)                │      │
-│  │                                                           │      │
-│  │   /openai/v1/chat/completions  ← Cline, Aider, Continue  │      │
-│  │   /mcp/                        ← Claude Desktop, MCP clients│    │
-│  │   /api/agent/chat/             ← your own frontend/API    │      │
-│  │   /api/agent/cmd/?op=...       ← raw LLM HTTP tool calls  │      │
-│  │                                                           │      │
-│  │   QueryRouter: resolves op aliases, handles fallback      │      │
-│  │        │                                                  │      │
-│  │        ▼                                                  │      │
-│  │   [cat] [dir] [tree] [search] [write] [patch] [shell]    │      │
-│  │   [git_status] [git_diff] [flake8] [django_check] [pytest]│      │
-│  └───────────────────────────────────────────────────────────┘      │
-│          │                                                          │
-│          │  LLM API call (Claude / GPT-4 / Ollama)                 │
-│          ▼                                                          │
-│  ┌───────────────┐                                                  │
-│  │  LLM reasons  │  reads file → finds bug → writes fix → verifies │
-│  └───────────────┘                                                  │
-│          │                                                          │
-│          ▼                                                          │
-│  Student sees: "Fixed! The variable `name` was used but never       │
-│  defined. I imported it from models.py on line 3."                  │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    Browser (Gemini / ChatGPT / Claude)      │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  content.js (Extension)                              │   │
+│  │                                                      │   │
+│  │  MutationObserver                                    │   │
+│  │    └─ detects "AGENT_CALL {…}" lines in AI output   │   │
+│  │         └─ McpClient.callTool(name, args)            │   │
+│  │              ├─ POST /mcp/messages  (JSON-RPC 2.0)   │   │
+│  │              └─ waits for SSE response               │   │
+│  │                                                      │   │
+│  │  Push Channel (EventSource /mcp/push/stream)         │   │
+│  │    └─ on "inject" event → typeIntoInput(text, true)  │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────┬───────────────────┬──────────────────────┘
+                   │ SSE + POST        │ SSE (push)
+                   ▼                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MCP Server  (FastMCP / Starlette ASGI — port 8001)         │
+│                                                             │
+│  GET  /mcp/sse           → SSE transport (MCP handshake)    │
+│  POST /mcp/messages      → JSON-RPC 2.0 method dispatch     │
+│  GET  /mcp/push/stream   → Server→Extension push channel    │
+│  POST /mcp/push/send     → Enqueue a push message           │
+│  GET  /mcp/health        → Liveness probe                   │
+│                                                             │
+│  Tools (all Pydantic-validated, zero parse errors):         │
+│    tree · dir · cat · search · write · patch · mkdir        │
+│    delete · shell · pytest · django_check · git_* · flake8  │
+└──────────────────┬──────────────────────────────────────────┘
+                   │ Python calls
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Django REST API  (port 8000)                               │
+│                                                             │
+│  POST /api/agent/chat/          → Agentic loop              │
+│  GET  /api/agent/chat/stream/   → SSE streaming             │
+│  POST /api/agent/push/          → push_to_extension()       │
+│  GET  /api/agent/tools/         → List all MCP tools        │
+│  CRUD /api/agent/sessions/…     → Session management        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
----
+## Why This Design
 
-## How Each Client Connects
-
-### Cline (VSCode Extension)
-
-Cline is a VSCode AI coding extension. It natively speaks the OpenAI tool-calling protocol. Point it at this server and it will autonomously read files, run commands, and write fixes — just like it would with the real OpenAI API, but running against your actual project.
-
-```json
-// VSCode settings.json
-{
-  "cline.apiProvider": "openai-compatible",
-  "cline.openAiBaseUrl": "http://localhost:8000/openai/v1",
-  "cline.openAiApiKey": "your-vibescode-token",
-  "cline.openAiModelId": "vibescode-agent"
-}
-```
-
-What happens:
-```
-Cline → POST /openai/v1/chat/completions
-      → Django injects VibesCode tools into LLM call
-      → LLM replies with tool_use: cat(views.py)
-      → Django executes cat, feeds result back to LLM
-      → LLM replies with tool_use: patch(views.py, old, new)
-      → Django applies the patch
-      → LLM replies: "Fixed. Here's what I changed."
-      → Cline shows the response in VSCode
-```
-
-Cline never sees your filesystem directly. It just talks to your Django server.
-
----
-
-### Continue.dev (VSCode / JetBrains Plugin)
-
-```json
-// ~/.continue/config.json
-{
-  "models": [{
-    "title": "VibesCode Agent",
-    "provider": "openai",
-    "model": "vibescode-agent",
-    "apiBase": "http://localhost:8000/openai/v1",
-    "apiKey": "your-vibescode-token"
-  }]
-}
-```
-
----
-
-### Cursor (Custom API Mode)
-
-In Cursor settings → Models → Add Model:
-```
-Model name:  vibescode-agent
-API base:    http://localhost:8000/openai/v1
-API key:     your-vibescode-token
-```
-
----
-
-### Aider (Terminal)
-
-```bash
-aider \
-  --openai-api-base http://localhost:8000/openai/v1 \
-  --openai-api-key your-vibescode-token \
-  --model vibescode-agent \
-  mainapp/views.py
-```
-
----
-
-### Claude Desktop (MCP)
-
-```json
-// ~/.claude/claude_desktop_config.json
-{
-  "mcpServers": {
-    "vibescode": {
-      "url": "http://localhost:8000/mcp/",
-      "headers": { "Authorization": "Bearer your-vibescode-token" }
-    }
-  }
-}
-```
-
-Claude Desktop connects via MCP (Model Context Protocol) — a JSON-RPC 2.0 protocol over HTTP/SSE. It discovers tools automatically via `GET /mcp/tools/`.
-
----
-
-### Raw HTTP / Your Own Frontend
-
-```bash
-# Simple chat — LLM reads and fixes things autonomously
-curl -X POST http://localhost:8000/api/agent/chat/ \
-  -H "Authorization: Bearer your-token" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Fix the NameError in mainapp/views.py", "project_root": "/home/student/project"}'
-
-# Direct tool call — no LLM involved
-curl "http://localhost:8000/api/agent/cmd/?op=cat&path=mainapp/views.py" \
-  -H "Authorization: Bearer your-token"
-
-# Streaming — see tool calls in real time
-curl -N "http://localhost:8000/api/agent/chat/stream/?message=Fix+my+bug" \
-  -H "Authorization: Bearer your-token" \
-  -H "Accept: text/event-stream"
-```
-
----
-
-### Terminal (Django CLI)
-
-```bash
-# Single shot
-python manage.py vibescode "Fix the NameError in mainapp/views.py"
-
-# Interactive session
-python manage.py vibescode --interactive
-
-# Direct tool without LLM
-python manage.py vibescode --tool cat --path mainapp/views.py
-python manage.py vibescode --tool pytest
-python manage.py vibescode --tool git_status
-```
-
----
-
-## The Query-Param Router
-
-This is the "universal glue" layer. Every LLM and tool has its own naming convention for operations. The router handles all of them.
-
-```
-LLM sends:  ?op=read_file&path=views.py
-            ?op=get_file&file=views.py
-            ?op=cat&path=views.py
-            ?op=view&filename=views.py
-                    ↓
-        QueryRouter resolves all → canonical: "cat"
-                    ↓
-            CatTool.run({path: "views.py"})
-                    ↓
-            {"ok": true, "data": "   1 | from django..."}
-```
-
-### Op Alias Table (partial)
-
-| What you send | Resolves to |
-|---|---|
-| `read`, `read_file`, `get_file`, `open`, `view` | `cat` |
-| `ls`, `list`, `list_dir`, `list_files` | `dir` |
-| `search`, `grep`, `find`, `regex`, `rg` | `search` |
-| `run`, `exec`, `execute`, `terminal`, `bash` | `shell` |
-| `write`, `save`, `create`, `write_file` | `write` |
-| `patch`, `replace`, `fix`, `edit`, `update` | `patch` |
-| `status`, `git_status` | `git_status` |
-| `diff`, `git_diff` | `git_diff` |
-| `check`, `django_check`, `manage_check` | `django_check` |
-| `test`, `pytest`, `run_tests`, `tests` | `pytest` |
-| `lint`, `flake8`, `pep8` | `flake8` |
-
-### Parameter Aliases
-
-The router also normalises parameter names:
-
-```
-?file=views.py          → path
-?filename=views.py      → path
-?file_path=views.py     → path
-?text=...               → content
-?data=...               → content
-?grep=NameError         → pattern
-?query=NameError        → pattern
-?command=pytest         → cmd
-```
-
-### Fallback Logic
-
-When an op is completely unknown, the fallback handler tries to recover:
-
-```
-Unknown op: "read_source_file"
-       │
-       ├─ Step 1: Fuzzy match → "read_source_file" contains "read" → try "cat"  ✓
-       │
-       ├─ Step 2: If fuzzy fails → infer from params:
-       │    has path + content → "write"
-       │    has pattern        → "search"
-       │    has cmd            → "shell"
-       │    has path only      → "cat"
-       │
-       └─ Step 3: If all fails → structured error:
-            {
-              "ok": false,
-              "error": "Unknown operation: read_source_file",
-              "suggestions": ["read", "cat", "search"],
-              "available_ops": [...all 40+ aliases...],
-              "hint": "Pass one of the available_ops as ?op=<name>"
-            }
-```
-
----
-
-## Protocol Support Matrix
-
-| Protocol | Endpoint | Used by |
-|---|---|---|
-| OpenAI Chat Completions | `POST /openai/v1/chat/completions` | Cline, Continue.dev, Cursor, Aider, LiteLLM |
-| OpenAI Models List | `GET /openai/v1/models` | Cline, Continue.dev (startup handshake) |
-| MCP JSON-RPC 2.0 | `POST /mcp/` | Claude Desktop, any MCP client |
-| MCP SSE Stream | `GET /mcp/` | Claude Desktop (server-push events) |
-| MCP Tool Manifest | `GET /mcp/tools/` | Claude Desktop, Cursor MCP mode |
-| VibesCode REST Chat | `POST /api/agent/chat/` | Your own frontend |
-| VibesCode SSE Chat | `GET /api/agent/chat/stream/` | Your own frontend |
-| VibesCode Direct Cmd | `GET/POST /api/agent/cmd/` | Raw LLM HTTP, curl, scripts |
-| Tool Discovery | `GET /api/agent/tools/` | Any client wanting tool list |
-
----
-
-## Available Tools
-
-| Tool | Op aliases | Description |
-|---|---|---|
-| `cat` | read, read_file, get_file, view, open | Read file with line numbers |
-| `dir` | ls, list, list_dir, list_files | List directory contents |
-| `tree` | tree, list_tree, full_tree | Full recursive directory tree |
-| `write` | write, save, write_file, create | Write full file (saves backup) |
-| `patch` | patch, fix, edit, replace, update | Surgical single-block replacement |
-| `mkdir` | mkdir, create_dir, make_dir | Create directories |
-| `delete` | delete, remove, rm | Delete file (saves backup) |
-| `search` | search, grep, find, regex, rg | Regex search with context lines |
-| `shell` | shell, run, exec, bash, terminal | Run sandboxed shell commands |
-| `git_status` | status, git_status | Working tree status |
-| `git_diff` | diff, git_diff | Diff vs HEAD |
-| `git_log` | log, history, git_log | Commit history |
-| `git_blame` | blame, git_blame | Line-by-line authorship |
-| `git_restore` | restore, revert | Restore file to last commit |
-| `flake8` | lint, flake8, pep8 | PEP8 + syntax linting |
-| `django_check` | check, django_check, manage_check | Django system check |
-| `pytest` | test, pytest, run_tests, tests | Run test suite |
+| Concern | Old approach | New approach |
+|---------|-------------|--------------|
+| Protocol | Hand-rolled JSON parsing in content.js | Official MCP SDK (FastMCP) — JSON-RPC 2.0 |
+| Parse errors | Regex + string matching | `JSON.parse()` on a single line — throws or succeeds |
+| Django→AI push | Not supported | EventSource `/mcp/push/stream` + `push_to_extension()` |
+| Tool definition | Hand-written dict matching in views.py | `@mcp.tool()` decorator — Pydantic auto-validates |
+| Background.js HTTP | Background did all API calls | Content.js speaks MCP directly; background is config-only |
 
 ---
 
 ## Installation
 
-### 1. Drop the app into your Django project
+### 1. Server dependencies
 
 ```bash
-cp -r project_agent/ /path/to/your/project/
+pip install mcp>=1.27 uvicorn starlette anyio a2wsgi
 ```
 
-### 2. Install deps
+### 2. Run MCP server (standalone — recommended)
 
 ```bash
-pip install django djangorestframework httpx gitpython python-dotenv
+# Set project root
+export VIBESCODE_PROJECT_ROOT=/path/to/your/django/project
+
+# Start MCP on port 8001
+python -m project_agent.mcp.server
 ```
 
-### 3. settings.py
-
-```python
-INSTALLED_APPS = [
-    "rest_framework",
-    "project_agent",
-    # ... your apps
-]
-
-VIBESCODE = {
-    # Required
-    "PROJECT_ROOT": "/home/student/myproject",
-
-    # LLM — swap provider with one line
-    "LLM_PROVIDER": "claude",       # "claude" | "openai" | "ollama"
-    "LLM_API_KEY":  "sk-ant-...",
-    "LLM_MODEL":    "claude-sonnet-4-20250514",
-    "LLM_BASE_URL": None,           # set for Ollama: "http://localhost:11434"
-
-    # Security
-    "API_TOKEN": "your-secret-token",
-    "ALLOWED_EXTENSIONS": [".py", ".html", ".js", ".css", ".json", ".md"],
-    "MAX_FILE_SIZE_KB": 500,
-
-    # Shell (opt in)
-    "ENABLE_SHELL": True,
-    "SHELL_TIMEOUT_SECONDS": 15,
-
-    # Prompt tuning
-    "SYSTEM_PROMPT_EXTRA": "Be encouraging. Students are beginners.",
-    "MAX_TOKENS": 4096,
-}
+Or with uvicorn directly:
+```bash
+uvicorn project_agent.mcp.server:get_asgi_app --factory --port 8001 --host 0.0.0.0
 ```
 
-### 4. urls.py
+### 3. Run Django (separate process)
 
+```bash
+python manage.py runserver 8000
+```
+
+### 4. Extension
+
+Update `MCP_BASE_URL` in `content.js`:
+```javascript
+const MCP_BASE_URL = "http://localhost:8001";  // or your production URL
+```
+
+Load the `extension/` folder as an unpacked Chrome extension.
+
+---
+
+## Option B: Mount MCP inside Django (single process)
+
+Requires uvicorn (not gunicorn WSGI):
+
+**myproject/urls.py:**
 ```python
+from a2wsgi import ASGIMiddleware
+from project_agent.mcp.server import get_asgi_app
+from django.urls import re_path
+
+_mcp = get_asgi_app()
+
 urlpatterns = [
-    # VibesCode REST API
     path("api/agent/", include("project_agent.urls")),
-
-    # MCP protocol (Claude Desktop, Cursor MCP mode)
-    path("mcp/", include("project_agent.mcp.urls")),
-
-    # OpenAI-compatible (Cline, Continue.dev, Aider, Cursor custom API)
-    path("openai/v1/", include("project_agent.openai_compat.urls")),
+    re_path(r"^mcp/", ASGIMiddleware(_mcp)),
 ]
 ```
 
-### 5. Migrate
+**myproject/asgi.py:**
+```python
+import os
+from django.core.asgi import get_asgi_application
 
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+application = get_asgi_application()
+```
+
+Run:
 ```bash
-python manage.py makemigrations project_agent
-python manage.py migrate
+uvicorn myproject.asgi:application --port 8000
+```
+
+Then set in content.js:
+```javascript
+const MCP_BASE_URL = "https://your-domain.com";
 ```
 
 ---
 
-## API Quick Reference
+## Pushing Messages from Django to the AI
 
-```
-# ── OpenAI-compatible (for Cline, Continue, Aider) ───────────────────────────
-POST /openai/v1/chat/completions       # chat + agentic tool loop
-GET  /openai/v1/models                 # model list (startup handshake)
+From anywhere in your Django codebase:
 
-# ── MCP protocol (for Claude Desktop, Cursor MCP mode) ───────────────────────
-GET  /mcp/                             # SSE stream (hold open for server events)
-POST /mcp/                             # JSON-RPC 2.0 method calls
-GET  /mcp/tools/                       # tool manifest
-GET  /mcp/resources/                   # project files as resources
+```python
+from project_agent.mcp.server import push_to_extension
 
-# ── VibesCode REST API (for your own frontend) ────────────────────────────────
-POST /api/agent/chat/                  # full agentic loop, JSON response
-GET  /api/agent/chat/stream/           # same, Server-Sent Events stream
+# Simple push — extension types this into AI and presses Send
+push_to_extension("Run pytest and fix any test failures.")
 
-# ── Direct tool execution (any naming convention accepted) ───────────────────
-GET  /api/agent/cmd/?op=cat&path=mainapp/views.py
-GET  /api/agent/cmd/?op=read_file&file=views.py       # alias works too
-GET  /api/agent/cmd/?op=dir&path=.
-GET  /api/agent/cmd/?op=tree
-GET  /api/agent/cmd/?op=search&pattern=NameError&path=.
-GET  /api/agent/cmd/?op=git_status
-GET  /api/agent/cmd/?op=django_check
-GET  /api/agent/cmd/?op=pytest
-POST /api/agent/cmd/  {"op": "write",  "path": "views.py", "content": "..."}
-POST /api/agent/cmd/  {"op": "patch",  "path": "views.py", "old_str": "...", "new_str": "..."}
-POST /api/agent/cmd/  {"op": "shell",  "cmd": "python manage.py check"}
+# From a view:
+class DeployView(APIView):
+    def post(self, request):
+        deploy()
+        push_to_extension("Deployment complete. Verify the /health endpoint.")
+        return Response({"ok": True})
 
-# ── Tool discovery ────────────────────────────────────────────────────────────
-GET  /api/agent/tools/                 # all tools + schemas + all op aliases
-
-# ── Sessions ──────────────────────────────────────────────────────────────────
-GET    /api/agent/sessions/
-GET    /api/agent/sessions/<uuid>/
-DELETE /api/agent/sessions/<uuid>/
-POST   /api/agent/sessions/<uuid>/undo/   # undo last file change
+# From a Celery task:
+@app.task
+def nightly_check():
+    push_to_extension("Run django_check and flake8 on the entire project.")
 ```
 
----
-
-## Security
-
-| Layer | What it does |
-|---|---|
-| Bearer token | All endpoints require `Authorization: Bearer <token>` |
-| Path sandbox | Every tool resolves paths inside `PROJECT_ROOT`, blocks `../` traversal |
-| Extension allowlist | Only configured file types can be read/written |
-| File size limit | Files over `MAX_FILE_SIZE_KB` refused |
-| Shell blocklist | `rm`, `sudo`, `kill`, `wget`, `curl` etc. always blocked |
-| Shell timeout | Commands killed after `SHELL_TIMEOUT_SECONDS` |
-| Audit trail | Every tool call, message, file change stored in DB |
-| Undo | Every file write saves previous version for rollback |
-
-Per-student isolation: pass a different `project_root` per session. No student can access another's project.
-
----
-
-## Advantages
-
-**vs local tools (Claude Code, Cursor, Aider):**
-Those tools run on the developer's machine. VibesCode runs on a server — so you can serve 100 students from one instance, control and audit every action, rate-limit, and students don't need any local install.
-
-**vs building from scratch:**
-- Protocol adapters for Cline, MCP, and OpenAI already done — any tool works day one
-- Universal query router — every op alias, every param name variation, handled
-- Custom fallback logic — unknown ops don't hard-fail, they try fuzzy match + inference
-- Full audit trail (DB) — every file change, every tool call, every session logged
-- Undo endpoint — any file change is reversible
-- SSE streaming — real-time tool-call visibility
-- Multi-LLM — Claude/GPT/Ollama behind one setting change
-
----
-
-## Limitations
-
-- **Sync workers**: The agentic loop blocks a Django thread. Run `gunicorn --workers 4+` for concurrent users.
-- **No streaming writes**: File writes are atomic, not streamed.
-- **MCP SSE keep-alive uses `time.sleep()`**: Fine for a few connections; use Django Channels for many.
-- **Shell is powerful**: `ENABLE_SHELL=True` lets the LLM run real commands. Use Docker per-project for untrusted code.
-- **No built-in rate limiting**: Add DRF throttling or Nginx limits in front.
-- **No approve-before-apply**: LLM writes files directly. A diff-preview step would be safer for production.
-- **Context window**: Very large projects need selective reading (use `search` first, then `cat` specific files).
-
----
-
-## Planned
-
-- [ ] Async views + `httpx.AsyncClient` for non-blocking LLM calls
-- [ ] Propose/approve mode — LLM shows diff, human confirms before write
-- [ ] Docker sandboxing per project (safe shell)
-- [ ] Redis pub/sub for SSE behind multiple workers
-- [ ] Token usage tracking per session/student
-- [ ] WebSocket transport for bidirectional IDE integration
-- [ ] Rate limiting per student/IP via DRF throttle classes
-
----
-
-## File Structure
-
-```
-project_agent/
-├── adapters/
-│   ├── openai_tools.py      ← OpenAI ↔ internal format converters
-│   └── query_router.py      ← op aliases, param normalisation, fallback logic
-│
-├── openai_compat/
-│   ├── views.py             ← /openai/v1/chat/completions (Cline, Aider, Continue)
-│   └── urls.py
-│
-├── mcp/
-│   ├── server.py            ← MCP JSON-RPC 2.0 + SSE (Claude Desktop)
-│   └── urls.py
-│
-├── tools/
-│   ├── base.py              ← BaseTool + ToolResult
-│   ├── filesystem.py        ← dir, tree, cat, write, patch, mkdir, delete
-│   ├── search.py            ← regex search
-│   ├── executor.py          ← shell (sandboxed)
-│   ├── git_tool.py          ← git status/diff/log/blame/restore
-│   ├── lint_tool.py         ← flake8, django_check, pytest
-│   └── registry.py          ← auto-discovery
-│
-├── services/
-│   ├── llm_client.py        ← HTTP to Claude/GPT/Ollama
-│   ├── agent.py             ← agentic loop (plan→tool→observe→repeat)
-│   ├── session.py           ← DB persistence
-│   └── streaming.py         ← SSE generator
-│
-├── management/commands/
-│   └── vibescode.py         ← python manage.py vibescode
-│
-├── models.py                ← AgentSession, Message, ToolCall, FileChange
-├── views.py                 ← REST + SSE views
-├── urls.py                  ← all API routes
-├── serializers.py
-├── permissions.py
-└── config.py
+Or via REST API from any service:
+```bash
+curl -X POST https://your-server.com/api/agent/push/ \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello from CI/CD pipeline!", "submit": true}'
 ```
 
+`submit: true`  → extension auto-presses Send (default)
+`submit: false` → extension fills the input; user reviews before sending
+
 ---
 
-## License
+## The AI System Prompt
 
-MIT.
-#   n e x t g e n  
- #   n e x t g e n  
- #   n e x t g e n  
- 
+Paste the contents of `SYSTEM_PROMPT.md` into the AI's system prompt or
+custom instructions. Key points:
+
+- AI emits `AGENT_CALL {"op":"cat","path":"views.py"}` — **one compact line**
+- Extension intercepts it via MutationObserver
+- Result injected back as `__TOOL_RESULT__` … `__END_RESULT__`
+- AI continues from result
+
+The single-line compact JSON format means:
+- No indentation/whitespace parse errors
+- No markdown fence confusion  
+- `JSON.parse()` either succeeds completely or fails completely (no partial matches)
+
+---
+
+## Security Notes
+
+- `_safe_path()` blocks directory traversal (`../`) in all file tools
+- The push channel has no auth by default — add token validation in `push_stream()` for production
+- The MCP server should run on localhost or behind a firewall in production; only expose `/api/agent/push/` publicly if needed

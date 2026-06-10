@@ -1,5 +1,5 @@
 """
-main.py — VibesCode Agent v12
+main.py — VibesCode Agent v13
 ══════════════════════════════════════════════════════════════════════════════
 Single-port FastAPI server.  All endpoints:
 
@@ -75,6 +75,8 @@ def get_project_root() -> str:
 
 def set_project_root(path: str) -> str:
     global _project_root
+    # Normalize path separators: convert backslashes to forward slashes first
+    path = path.replace("\\\\", "/").replace("\\", "/")
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise ValueError(f"Path does not exist: {path}")
@@ -94,8 +96,11 @@ def _safe(rel: str) -> Path:
     Accept EITHER:
       • An absolute path on any drive  (C:\\..., /home/..., D:\\...)
       • A path relative to project root
+    Normalizes backslashes to forward slashes before processing.
     Guards against traversal only when relative.
     """
+    # Normalize all backslash variants to forward slash
+    rel = rel.replace("\\\\", "/").replace("\\", "/")
     p = Path(rel).expanduser()
     if p.is_absolute():
         return p.resolve()
@@ -119,6 +124,25 @@ def _run(cmd: str, timeout: int = 60, cwd: str | None = None) -> str:
         return f"ERROR: command timed out after {timeout}s"
     except Exception as exc:
         return f"ERROR: {exc}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEMPLATE / PLAN STORAGE  — persistent JSON file next to main.py
+# ══════════════════════════════════════════════════════════════════════════════
+_TEMPLATES_FILE = Path(__file__).parent / "vibescode_templates.json"
+
+
+def _load_templates() -> dict:
+    if _TEMPLATES_FILE.exists():
+        try:
+            return json.loads(_TEMPLATES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_templates(data: dict) -> None:
+    _TEMPLATES_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -180,19 +204,16 @@ class ExtensionState:
     def to_dict(self) -> dict:
         age = round(time.time() - self.last_seen, 1) if self.last_seen else None
         return {
-            # Connection
             "connected":           self.connected and not self.is_stale(),
             "stale":               self.is_stale(),
             "tab_id":              self.tab_id,
             "platform":            self.platform,
             "page_url":            self.page_url,
-            # LLM / UI state
             "llm_state":           self.llm_state,
             "is_generating":       self.bot_typing,
             "send_button_status":  self.send_button_status,
             "send_button_active":  self.send_button_status == "active",
             "input_empty":         self.input_empty,
-            # Injection readiness
             "mcp_ready":           self.mcp_ready,
             "can_inject":          self.can_inject(),
             "last_seen_s":         age,
@@ -262,13 +283,17 @@ def set_root(path: str) -> str:
     """
     Set the project root dynamically to any absolute path on any drive.
 
-    Examples:
-        {"path": "C:\\Users\\user\\Desktop\\myapp"}
-        {"path": "/home/user/projects/myapp"}
-        {"path": "D:\\work\\backend"}
+    Accepts Windows paths with single or double backslashes, forward slashes,
+    and Unix paths. All path separators are normalised automatically.
 
-    The agent should call this at the start of every session when the user
-    mentions a project path, or when switching to a different project.
+    Examples:
+        {"path": "C:\\\\Users\\\\user\\\\Desktop\\\\myapp"}
+        {"path": "C:/Users/user/Desktop/myapp"}
+        {"path": "/home/user/projects/myapp"}
+        {"path": "D:/work/backend"}
+
+    Call this at the start of every session when the user mentions a project path,
+    or when switching to a different project.
     Returns the resolved absolute path of the new root.
     """
     try:
@@ -283,12 +308,16 @@ def detect_root(hint: str) -> str:
     """
     Auto-detect project root from any file or folder path inside the project.
 
+    Accepts Windows paths (backslashes, double-backslashes) or Unix paths.
+    All separators are normalised before use.
+
     Walks up from the hint path until it finds a project marker
     (package.json, pyproject.toml, Cargo.toml, go.mod, .git, manage.py, etc.)
 
-    Example:
-        {"hint": "C:\\Users\\user\\Desktop\\myapp\\src\\index.tsx"}
-        → detects C:\\Users\\user\\Desktop\\myapp as root
+    Examples:
+        {"hint": "C:\\\\Users\\\\user\\\\Desktop\\\\myapp\\\\src\\\\index.tsx"}
+        {"hint": "C:/Users/user/Desktop/myapp/src/index.tsx"}
+        → detects C:/Users/user/Desktop/myapp as root
 
     Use this when the user pastes a file path or folder path and you need
     to determine the project root automatically.
@@ -298,6 +327,8 @@ def detect_root(hint: str) -> str:
         "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", ".git",
         "Makefile", "next.config.js", "next.config.ts", "vite.config.ts",
     }
+    # Normalise separators
+    hint = hint.replace("\\\\", "/").replace("\\", "/")
     p = Path(hint).expanduser().resolve()
     if p.is_file():
         p = p.parent
@@ -320,11 +351,18 @@ def detect_root(hint: str) -> str:
         return f"ERROR: {e}"
 
 
-
 import inspect
 
 @mcp.tool()
 async def list_mcp_tools() -> str:
+    """
+    List every tool currently registered on this MCP server.
+
+    Returns the tool name and first line of its description.
+    Use this at the start of a session to remind yourself what operations
+    are available, or when you are unsure which tool to call.
+    No parameters required.
+    """
     tools = None
 
     if hasattr(mcp, "list_tools"):
@@ -342,24 +380,28 @@ async def list_mcp_tools() -> str:
         name = getattr(t, "name", str(t))
         raw_desc = getattr(t, "description", "") or getattr(t, "__doc__", "")
         desc = raw_desc if raw_desc is not None else ""
-        
-        # Safe splitlines extraction
         split_lines = desc.splitlines()
         first_line = split_lines[0][:120] if split_lines else "No description provided."
-        
         lines.append(f"  • {name}: {first_line}")
 
     return "\n".join(lines)
+
+
 # ── File & directory tools ─────────────────────────────────────────────────────
 
 @mcp.tool()
 def tree(path: str = ".") -> str:
     """
-    Recursive directory tree.
+    Recursive directory tree starting at the given path.
 
-    path: absolute path (any drive) or relative to project root.
-    Use "." to list the current project root.
-    Use set_root first if the project root is not yet set correctly.
+    Skips common noise directories: .git, node_modules, __pycache__, .venv,
+    dist, build, .next, .turbo, coverage, .cache, out, .nuxt, .svelte-kit.
+
+    path: absolute path (any drive, backslashes or forward slashes) or
+          relative to project root. Use "." to list the project root.
+    Use set_root / detect_root first if the project root is not yet set correctly.
+
+    Returns a tree with 📁 for directories and 📄 for files.
     """
     try:
         root = _safe(path)
@@ -381,9 +423,13 @@ def tree(path: str = ".") -> str:
 @mcp.tool()
 def dir_list(path: str = ".") -> str:
     """
-    List immediate contents of a directory.
+    List the immediate (non-recursive) contents of a directory.
 
-    path: absolute path (any drive) or relative to project root.
+    path: absolute path (any drive, backslashes or forward slashes) or
+          relative to project root. Defaults to the project root.
+
+    Returns one entry per line prefixed with 📁 (directory) or 📄 (file).
+    Use tree for a deep recursive listing.
     """
     try:
         target = _safe(path)
@@ -398,10 +444,16 @@ def dir_list(path: str = ".") -> str:
 @mcp.tool()
 def cat(path: str) -> str:
     """
-    Read full file contents.
+    Read the full contents of a file and return them as plain text.
 
-    path: absolute path (any drive) or relative to project root.
-    Large files are truncated at 8000 chars — use cat_range to page through them.
+    path: absolute path (any drive, backslashes or forward slashes accepted)
+          or relative to project root.
+
+    Files larger than 8 000 characters are NOT truncated — the entire file is
+    returned so the agent always sees the complete source.  Use cat_range to
+    page through very large files when you only need a specific section.
+
+    Always call cat before editing any file so you work with the real content.
     """
     try:
         target = _safe(path)
@@ -413,9 +465,6 @@ def cat(path: str) -> str:
         return f"ERROR: not a file: {path}"
     try:
         text = target.read_text(encoding="utf-8", errors="replace")
-        MAX  = 8_000
-        if len(text) > MAX:
-            return text[:MAX] + f"\n\n[TRUNCATED — {len(text)} total chars. Use cat_range to read more.]"
         return text
     except Exception as exc:
         return f"ERROR reading {path}: {exc}"
@@ -424,11 +473,16 @@ def cat(path: str) -> str:
 @mcp.tool()
 def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
     """
-    Read a specific line range from a file.
+    Read a specific range of lines from a file (1-based, inclusive).
 
-    path: absolute path or relative to project root.
-    start_line / end_line: 1-based line numbers (inclusive).
-    Use this to page through files that were truncated by cat.
+    path: absolute path (any drive) or relative to project root.
+    start_line: first line to return (1-based, default 1).
+    end_line:   last line to return (1-based, inclusive, default 100).
+
+    Use this to page through large files. Each returned line is prefixed with
+    its line number so you can reference exact positions when patching.
+
+    Example: {"path": "src/main.py", "start_line": 50, "end_line": 120}
     """
     try:
         target = _safe(path)
@@ -448,12 +502,21 @@ def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
 @mcp.tool()
 def search(pattern: str, path: str = ".", extensions: str = "") -> str:
     """
-    Regex search across files.
+    Search files for a regex pattern and return matching lines with locations.
 
-    pattern: Python regex (case-insensitive).
-    path: root directory to search (absolute or relative). Defaults to project root.
-    extensions: comma-separated list, e.g. ".py,.ts" to filter by file type.
-    Returns up to 200 matching lines with file:line: content format.
+    pattern:    Python regular expression (case-insensitive).
+    path:       Root directory to search (absolute or relative to project root).
+                Defaults to the entire project root.
+    extensions: Optional comma-separated file extension filter, e.g. ".py,.ts".
+                Leave empty to search all file types.
+
+    Returns up to 200 matching lines in the format  file:line: content.
+    Skips noise directories (.git, node_modules, __pycache__, etc.)
+
+    Examples:
+        {"pattern": "def handle_request", "extensions": ".py"}
+        {"pattern": "TODO|FIXME", "path": "src"}
+        {"pattern": "import.*axios", "extensions": ".ts,.tsx"}
     """
     try:
         root = _safe(path)
@@ -489,12 +552,16 @@ def search(pattern: str, path: str = ".", extensions: str = "") -> str:
 @mcp.tool()
 def write(path: str, content: str) -> str:
     """
-    Create or overwrite a file.
+    Create a new file or completely overwrite an existing one.
 
-    path: absolute path (any drive) or relative to project root.
-    content: full file content as a string.
+    path:    Absolute path (any drive, backslashes or forward slashes) or
+             relative to project root.
+    content: The full file content as a plain string.
+
     Parent directories are created automatically.
-    CAUTION: overwrites existing files. Prefer patch for targeted edits.
+    CAUTION: this overwrites existing files without confirmation.
+    Prefer patch for targeted edits to avoid accidentally erasing code.
+    Always cat the file first unless you are creating it from scratch.
     """
     try:
         target = _safe(path)
@@ -509,12 +576,23 @@ def write(path: str, content: str) -> str:
 @mcp.tool()
 def patch(path: str, old_str: str, new_str: str) -> str:
     """
-    Atomic find-and-replace in a file.
+    Perform a precise, atomic find-and-replace edit inside a file.
 
-    path: absolute path or relative to project root.
-    old_str: exact string to find (must appear exactly once in the file).
-    new_str: replacement string.
+    path:    Absolute path or relative to project root.
+    old_str: The exact string to locate in the file. Must appear EXACTLY ONCE.
+             Make it specific enough to be unique — include surrounding lines if needed.
+    new_str: The replacement string. Use an empty string to delete old_str.
+
     Always cat the file first to confirm old_str is present and unique.
+    If old_str appears more than once the tool returns an error; add more context.
+    This is the safest way to edit files — prefer it over write for targeted changes.
+
+    Example:
+        {
+          "path": "src/app.py",
+          "old_str": "def hello():\\n    return 'hi'",
+          "new_str": "def hello():\\n    return 'hello, world'"
+        }
     """
     try:
         target = _safe(path)
@@ -536,7 +614,13 @@ def patch(path: str, old_str: str, new_str: str) -> str:
 
 @mcp.tool()
 def mkdir(path: str) -> str:
-    """Create a directory (and all parents). path: absolute or relative."""
+    """
+    Create a directory and all its parent directories (equivalent to mkdir -p).
+
+    path: Absolute path (any drive) or relative to project root.
+    Does nothing if the directory already exists.
+    Returns OK with the resolved path on success.
+    """
     try:
         target = _safe(path)
     except ValueError as e:
@@ -548,10 +632,13 @@ def mkdir(path: str) -> str:
 @mcp.tool()
 def delete(path: str) -> str:
     """
-    Delete a single file.
+    Delete a single file permanently.
 
-    path: absolute or relative to project root.
-    To remove a directory use shell with rmdir/rm -rf.
+    path: Absolute path or relative to project root.
+    Only works on files — use shell with rm -rf or rmdir to remove directories.
+    Returns an error if the path does not exist or is a directory.
+
+    CAUTION: deletion is irreversible. Confirm the path with cat or dir_list first.
     """
     try:
         target = _safe(path)
@@ -570,26 +657,32 @@ def delete(path: str) -> str:
 @mcp.tool()
 def shell(cmd: str, cwd: str = "", timeout: int = 120) -> str:
     """
-    Execute any shell command with full power.
+    Execute any shell command and return the combined stdout + stderr output.
 
-    cmd:     Shell command string — supports pipes, redirection, &&, ||, etc.
-    cwd:     Working directory (absolute or relative to project root).
-             Defaults to project root if empty.
-    timeout: Seconds before the command is killed. Default 120, max 600.
+    cmd:     Any shell command string — supports pipes, redirection, &&, ||, etc.
+    cwd:     Working directory (absolute path or relative to project root).
+             Defaults to the project root if empty.
+    timeout: Maximum seconds before the command is killed. Default 120, max 600.
 
-    Works for ALL runtimes: Python, Node, npm/yarn/pnpm, Rust/cargo,
-    Go, Java/Maven/Gradle, Ruby, PHP, Make, Docker, git, curl, etc.
+    Works for ALL runtimes and tools:
+        Python  — pip, pytest, manage.py, scripts
+        Node    — npm, yarn, pnpm, npx, node
+        Rust    — cargo build, cargo test, cargo run
+        Go      — go build, go test, go run
+        Java    — mvn, gradle
+        Git     — git status, git commit, git push
+        System  — curl, find, cat, ls, type, dir, powershell
 
-    Examples:
+    Safe command patterns (no quoting issues):
         {"cmd": "npm install && npm run build"}
         {"cmd": "python -m pytest tests/ -v --tb=short"}
-        {"cmd": "cargo build --release"}
+        {"cmd": "cargo build --release", "timeout": 300}
         {"cmd": "git log --oneline -20"}
-        {"cmd": "find . -name '*.py' | xargs wc -l"}
-        {"cmd": "cat /etc/os-release"}
+        {"cmd": "dir C:/Users/foo/project"}
 
-    CAUTION: This runs with the same permissions as the server process.
-    Avoid destructive commands (rm -rf, DROP TABLE, etc.) unless explicitly requested.
+    CAUTION: runs with server process permissions.
+    Avoid destructive commands (rm -rf, DROP TABLE) unless explicitly requested.
+    Use cat instead of shell for reading files.
     """
     work = get_project_root()
     if cwd:
@@ -605,15 +698,22 @@ def shell(cmd: str, cwd: str = "", timeout: int = 120) -> str:
 @mcp.tool()
 def run_tests(cmd: str = "", path: str = ".") -> str:
     """
-    Run the project's test suite.
+    Run the project test suite with auto-detection of the test framework.
 
-    cmd: custom command (e.g. 'npm test', 'cargo test', 'pytest tests/').
-    Auto-detects framework if cmd is empty:
-      - package.json  → npm test
-      - Cargo.toml    → cargo test
-      - go.mod        → go test ./...
-      - pyproject.toml / setup.py → pytest
-      - Makefile      → make test
+    cmd:  Custom test command. If empty, the tool detects the right command:
+          • package.json  → npm test --if-present
+          • Cargo.toml    → cargo test
+          • go.mod        → go test ./...
+          • pyproject.toml / setup.py → python -m pytest <path> --tb=short
+          • Makefile      → make test
+          • fallback      → python -m pytest <path> --tb=short
+
+    path: Scope pytest to a specific directory or file (only used for Python).
+
+    Examples:
+        {}                              — auto-detect and run all tests
+        {"cmd": "npm run test:unit"}    — run a specific npm script
+        {"cmd": "pytest src/ -k login"} — run only tests matching "login"
     """
     root = _root()
     if not cmd:
@@ -635,13 +735,20 @@ def run_tests(cmd: str = "", path: str = ".") -> str:
 @mcp.tool()
 def lint(cmd: str = "", path: str = ".") -> str:
     """
-    Run the project's linter.
+    Run the project linter with auto-detection of the linting tool.
 
-    cmd: custom command. Auto-detects if empty:
-      - package.json  → npm run lint
-      - Cargo.toml    → cargo clippy
-      - .eslintrc.*   → npx eslint
-      - otherwise     → flake8
+    cmd:  Custom lint command. If empty, the tool detects the right command:
+          • package.json  → npm run lint --if-present
+          • Cargo.toml    → cargo clippy
+          • .eslintrc.*   → npx eslint <path>
+          • fallback      → python -m flake8 <path> --max-line-length=120
+
+    path: Scope linting to a specific directory or file (used in fallback mode).
+
+    Examples:
+        {}                              — auto-detect and lint everything
+        {"cmd": "npx eslint src/ --fix"} — lint and auto-fix JS/TS
+        {"cmd": "ruff check ."}          — use ruff for Python
     """
     root = _root()
     if not cmd:
@@ -660,17 +767,30 @@ def lint(cmd: str = "", path: str = ".") -> str:
 
 @mcp.tool()
 def git_status() -> str:
-    """Show git working tree status (short format with branch)."""
+    """
+    Show the current git working tree status in short format with branch name.
+
+    Equivalent to: git status --short --branch
+    Returns the branch, staged changes (A/M/D), and unstaged changes (M/D/?).
+    No parameters required.
+    """
     return _run("git status --short --branch")
 
 
 @mcp.tool()
 def git_diff(path: str = "", staged: bool = False) -> str:
     """
-    Show git diff.
+    Show the diff of working tree changes (or staged changes).
 
-    path: optional file/directory to scope the diff.
-    staged: if True, show staged (--cached) diff.
+    path:   Optional file or directory to scope the diff to.
+            Leave empty to diff the entire repository.
+    staged: Set to true to show staged (--cached) changes instead of
+            unstaged working-tree changes. Default false.
+
+    Examples:
+        {}                         — show all unstaged changes
+        {"staged": true}           — show what is staged for commit
+        {"path": "src/api.py"}     — diff a specific file
     """
     cmd = "git diff" + (" --cached" if staged else "")
     if path:
@@ -681,10 +801,18 @@ def git_diff(path: str = "", staged: bool = False) -> str:
 @mcp.tool()
 def git_log(n: int = 10, path: str = "") -> str:
     """
-    Show git commit history (one-line format).
+    Show recent git commit history in compact one-line format.
 
-    n: number of commits (default 10).
-    path: optional file/directory to scope the log.
+    n:    Number of commits to show. Default 10.
+    path: Optional file or directory to scope the log to.
+          Leave empty to show the full project history.
+
+    Each line shows: <short-hash> <commit message>
+
+    Examples:
+        {}                  — last 10 commits
+        {"n": 25}           — last 25 commits
+        {"path": "src/"}    — commits that touched the src directory
     """
     cmd = f"git log --oneline -{n}"
     if path:
@@ -696,18 +824,29 @@ def git_log(n: int = 10, path: str = "") -> str:
 
 @mcp.tool()
 def get_root() -> str:
-    """Return the current project root path."""
+    """
+    Return the current project root path as a string.
+
+    No parameters required.
+    Call this at the very start of every session to confirm where you are
+    before exploring the filesystem or making any edits.
+    """
     return get_project_root()
 
 
 @mcp.tool()
 def project_info() -> str:
     """
-    Detect project type and summarise the workspace.
+    Detect the project type and summarise the workspace at a glance.
 
-    Returns framework/language markers found in the project root,
-    top file types by count, and the resolved project root path.
-    Useful at the start of a session to orient yourself before exploring.
+    Checks the project root for framework/language marker files
+    (package.json, pyproject.toml, Cargo.toml, go.mod, manage.py, etc.)
+    and reports the top file types by count.
+
+    No parameters required.
+    Call this after get_root / detect_root to orient yourself before exploring.
+    The output tells you what runtime, framework, and languages are in use
+    so you can pick the right commands and tools.
     """
     root = _root()
     info: list[str] = [f"Project root: {root}"]
@@ -747,6 +886,109 @@ def project_info() -> str:
     return "\n".join(info)
 
 
+# ── Template / Plan tools ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def template_prompt(
+    action: str,
+    name: str = "",
+    content: str = "",
+    tag: str = "",
+) -> str:
+    """
+    Store, retrieve, list, and delete reusable prompt templates and task plans.
+
+    Templates are persisted to disk (vibescode_templates.json next to main.py)
+    so they survive server restarts and are shared across all sessions.
+
+    action — one of:
+        "save"    Save or overwrite a template.
+                  Requires: name (unique key), content (the prompt text).
+                  Optional: tag (category label, e.g. "plan", "system", "task").
+        "get"     Retrieve a single template by name.
+                  Requires: name.
+        "list"    List all stored templates (name + tag + first 80 chars).
+                  Optional: tag to filter by category.
+        "delete"  Delete a template by name.
+                  Requires: name.
+
+    Use cases:
+        • Store the master system prompt so every session starts consistently.
+        • Save a task plan at the start of a large feature so any sub-task
+          can load it and know the full context and remaining steps.
+        • Keep reusable prompt snippets (debugging guide, code-style rules, etc.)
+
+    Examples:
+        Save a plan:
+            {
+              "action": "save",
+              "name": "feature/auth-refactor",
+              "tag": "plan",
+              "content": "## Goal\\nRefactor auth to use JWT...\\n## Steps\\n1. Read current auth.py\\n2. ..."
+            }
+
+        Retrieve it in any later session:
+            {"action": "get", "name": "feature/auth-refactor"}
+
+        List all plans:
+            {"action": "list", "tag": "plan"}
+
+        Delete when done:
+            {"action": "delete", "name": "feature/auth-refactor"}
+    """
+    data = _load_templates()
+
+    if action == "save":
+        if not name:
+            return "ERROR: name is required for action=save"
+        if not content:
+            return "ERROR: content is required for action=save"
+        data[name] = {
+            "content": content,
+            "tag": tag or "general",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        _save_templates(data)
+        return f"OK: saved template '{name}' (tag={tag or 'general'}, {len(content)} chars)"
+
+    elif action == "get":
+        if not name:
+            return "ERROR: name is required for action=get"
+        if name not in data:
+            available = ", ".join(sorted(data.keys())) or "(none)"
+            return f"ERROR: template '{name}' not found. Available: {available}"
+        entry = data[name]
+        return (
+            f"# Template: {name}\n"
+            f"# Tag: {entry.get('tag','')}\n"
+            f"# Updated: {entry.get('updated_at','')}\n\n"
+            f"{entry['content']}"
+        )
+
+    elif action == "list":
+        if not data:
+            return "No templates stored yet."
+        rows = []
+        for k, v in sorted(data.items()):
+            if tag and v.get("tag", "") != tag:
+                continue
+            preview = v["content"][:80].replace("\n", " ")
+            rows.append(f"  [{v.get('tag',''):10s}] {k}\n             {preview}…")
+        return f"Stored templates ({len(rows)} shown):\n" + "\n".join(rows) if rows else "No templates match that tag."
+
+    elif action == "delete":
+        if not name:
+            return "ERROR: name is required for action=delete"
+        if name not in data:
+            return f"ERROR: template '{name}' not found."
+        del data[name]
+        _save_templates(data)
+        return f"OK: deleted template '{name}'"
+
+    else:
+        return f"ERROR: unknown action '{action}'. Use: save, get, list, delete"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -755,15 +997,15 @@ async def lifespan(app: FastAPI):
     global _event_loop
     _event_loop = asyncio.get_running_loop()
     asyncio.create_task(_push_dispatcher())
-    logger.info("VibesCode v12 started — root: %s", get_project_root())
+    logger.info("VibesCode v13 started — root: %s", get_project_root())
     yield
     logger.info("VibesCode shutting down")
 
 
 app = FastAPI(
-    title="VibesCode Agent v12",
-    description="MCP-powered coding agent with dynamic project root and rich status",
-    version="12.0.0",
+    title="VibesCode Agent v13",
+    description="MCP-powered coding agent with dynamic project root, template store, and rich status",
+    version="13.0.0",
     lifespan=lifespan,
 )
 
@@ -774,8 +1016,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# app.mount("/mcp", mcp.http_app(transport="sse"))
-mcp_app = mcp.http_app(transport="sse")   # or omit transport= for Streamable HTTP
+mcp_app = mcp.http_app(transport="sse")
 app.mount("/mcp", mcp_app)
 
 SECRET = os.environ.get("VIBESCODE_SECRET", "")
@@ -786,7 +1027,6 @@ def _check_auth(x_token: str | None):
         raise HTTPException(status_code=403, detail="Invalid X-Token")
 
 
-# ── Tool registry helper ──────────────────────────────────────────────────────
 def _get_registered_tools() -> list:
     try:
         tm = getattr(mcp, "_tool_manager", None)
@@ -841,17 +1081,6 @@ class PushRequest(BaseModel):
 
 @app.post("/push/send", tags=["Extension"])
 async def push_send(body: PushRequest, x_token: str | None = Header(default=None)) -> dict:
-    """
-    Enqueue a message to be injected into the AI chat.
-
-    Waits for the extension to report 'injectable' state before sending.
-    Messages that aren't delivered within 120s are dropped with a warning.
-
-    Example:
-        curl -X POST http://localhost:8000/push/send \\
-          -H "Content-Type: application/json" \\
-          -d '{"text": "Run the tests and fix any failures.", "submit": true}'
-    """
     _check_auth(x_token)
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty")
@@ -879,51 +1108,29 @@ async def push_ack(body: AckRequest) -> dict:
 
 
 class HeartbeatRequest(BaseModel):
-    tab_id:           str  = ""
-    platform:         str  = ""
-    llm_state:        str  = "unknown"
-    send_button_status: str = "unknown"   # active | disabled | not_found | unknown
-    input_empty:      bool = True
-    bot_typing:       bool = False
-    page_url:         str  = ""
-    mcp_ready:        bool = False
+    tab_id:             str  = ""
+    platform:           str  = ""
+    llm_state:          str  = "unknown"
+    send_button_status: str  = "unknown"
+    input_empty:        bool = True
+    bot_typing:         bool = False
+    page_url:           str  = ""
+    mcp_ready:          bool = False
 
 
 @app.post("/ext/heartbeat", tags=["Extension"])
 async def ext_heartbeat(body: HeartbeatRequest) -> dict:
-    """
-    Extension POSTs this every ~2s with its live state.
-
-    send_button_status:
-        "active"    — button found and not disabled
-        "disabled"  — button found but grayed out
-        "not_found" — no button detected on the page
-        "unknown"   — not yet determined
-    """
     _ext_state.update(body.model_dump())
     return {"ok": True, "queue_depth": _push_queue.qsize()}
 
 
 @app.get("/ext/status", tags=["Extension"])
 async def ext_status() -> dict:
-    """
-    Returns the full live state of the extension + LLM.
-
-    Key fields:
-        is_generating:       True while the AI is streaming a response
-        llm_state:           generating | idle | injectable | injecting | unknown
-        send_button_status:  active | disabled | not_found | unknown
-        send_button_active:  convenience bool — True when button is clickable
-        input_empty:         True when the chat input box is empty
-        can_inject:          True when it is safe to push the next message
-        connected:           True when extension heartbeat is recent (<8s)
-        stale:               True when heartbeat is older than 8s
-    """
     return _ext_state.to_dict()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROJECT ROOT HTTP ENDPOINTS  (mirrors the MCP tools for REST clients)
+# PROJECT ROOT HTTP ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SetRootRequest(BaseModel):
@@ -937,13 +1144,6 @@ async def project_root_get() -> dict:
 
 @app.post("/project/set", tags=["Project"])
 async def project_root_set(body: SetRootRequest) -> dict:
-    """
-    Set the project root at runtime — no server restart needed.
-
-    Example:
-        curl -X POST http://localhost:8000/project/set \\
-          -d '{"path": "C:\\\\Users\\\\user\\\\Desktop\\\\myapp"}'
-    """
     try:
         new_root = set_project_root(body.path)
         return {"ok": True, "root": new_root}
@@ -957,18 +1157,13 @@ class DetectRootRequest(BaseModel):
 
 @app.post("/project/detect", tags=["Project"])
 async def project_root_detect(body: DetectRootRequest) -> dict:
-    """
-    Auto-detect project root from any file or folder path inside the project.
-
-    Example:
-        {"hint": "C:\\Users\\user\\Desktop\\myapp\\src\\index.tsx"}
-    """
     MARKERS = {
         "package.json", "pyproject.toml", "setup.py", "manage.py", "Cargo.toml",
         "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", ".git",
         "Makefile", "next.config.js", "next.config.ts", "vite.config.ts",
     }
-    p = Path(body.hint).expanduser().resolve()
+    hint = body.hint.replace("\\\\", "/").replace("\\", "/")
+    p = Path(hint).expanduser().resolve()
     if p.is_file():
         p = p.parent
     candidate = p
@@ -992,6 +1187,59 @@ async def project_root_detect(body: DetectRootRequest) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TEMPLATES HTTP ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TemplateSaveRequest(BaseModel):
+    name: str
+    content: str
+    tag: str = "general"
+
+
+@app.get("/templates", tags=["Templates"])
+async def templates_list(tag: str = "") -> dict:
+    """List all stored templates, optionally filtered by tag."""
+    data = _load_templates()
+    items = []
+    for k, v in sorted(data.items()):
+        if tag and v.get("tag", "") != tag:
+            continue
+        items.append({"name": k, "tag": v.get("tag", ""), "updated_at": v.get("updated_at", ""),
+                      "preview": v["content"][:120]})
+    return {"templates": items, "total": len(items)}
+
+
+@app.get("/templates/{name:path}", tags=["Templates"])
+async def templates_get(name: str) -> dict:
+    """Get a single template by name."""
+    data = _load_templates()
+    if name not in data:
+        raise HTTPException(status_code=404, detail=f"Template '{name}' not found")
+    return {"name": name, **data[name]}
+
+
+@app.post("/templates", tags=["Templates"])
+async def templates_save(body: TemplateSaveRequest) -> dict:
+    """Save or overwrite a template."""
+    data = _load_templates()
+    data[body.name] = {"content": body.content, "tag": body.tag,
+                       "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    _save_templates(data)
+    return {"ok": True, "name": body.name}
+
+
+@app.delete("/templates/{name:path}", tags=["Templates"])
+async def templates_delete(name: str) -> dict:
+    """Delete a template by name."""
+    data = _load_templates()
+    if name not in data:
+        raise HTTPException(status_code=404, detail=f"Template '{name}' not found")
+    del data[name]
+    _save_templates(data)
+    return {"ok": True, "deleted": name}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # META ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1006,7 +1254,7 @@ async def health() -> dict:
     return {
         "ok":           True,
         "server":       "vibescode-agent",
-        "version":      "12.0.0",
+        "version":      "13.0.0",
         "project_root": get_project_root(),
         "tools":        tool_names,
         "tool_count":   len(tool_names),
@@ -1018,7 +1266,6 @@ async def health() -> dict:
 
 @app.get("/tools", tags=["Meta"])
 async def list_tools_endpoint() -> dict:
-    """List all MCP tools with names and descriptions."""
     raw_tools = _get_registered_tools()
     tools = []
     for t in raw_tools:

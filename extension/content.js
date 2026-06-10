@@ -1,12 +1,13 @@
-// content.js — VibesCode Agent v13 (Final+)
+// content.js — VibesCode Agent v13 (Final++)
 // ════════════════════════════════════════════════════════════════════════════
 // Improvements over v12:
 //   • Background tab — detailed event log for EVERYTHING the agent does
 //   • Tool tab — only shows MCP hit / waiting / received
 //   • Panel is resizable (drag any edge/corner) and hideable (toggle button)
-//   • Path normalization: \\ and \ → / (fixes Windows parse errors)
+//   • Traceable IDs on every input/response/MCP req/res
+//   • Parse error → skip (no retry loop)
+//   • All AGENT_CALL lines queued per scan (no break after first)
 //   • cat results are NEVER chunked — full content injected as one message
-//   • All ops have clear logging at every lifecycle stage
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
   "use strict";
@@ -158,6 +159,43 @@
       }
     }
     return result;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TRACEABLE IDs — time-based, human-readable request/response chains
+  //   input-20250611121923045123   user message
+  //   resp-20250611121923051234    AI response / AGENT_CALL
+  //   mcpreq-resp-..._1718123456789  MCP request
+  //   mcpres-mcpreq-..._1718123456790 MCP response
+  // ══════════════════════════════════════════════════════════════════════════
+  function makeTimeId(prefix) {
+    const ms  = Date.now();
+    const sub = String(Math.floor((performance.now() % 1) * 1_000_000)).padStart(6, "0");
+    return `${prefix}-${ms}${sub}`;
+  }
+
+  function makeMcpReqId(responseId) {
+    return `mcpreq-${responseId}_${Date.now()}`;
+  }
+
+  function makeMcpResId(mcpReqId) {
+    return `mcpres-${mcpReqId}_${Date.now()}`;
+  }
+
+  /** One-pass JSON prep — normalise path backslashes before parse (not a retry). */
+  function preprocessAgentCallJson(jsonPart) {
+    return jsonPart
+      .replace(/\\\\/g, "/")
+      .replace(/\\(?!["\\/bfnrtu])/g, "/");
+  }
+
+  function formatToolResultHeader(toolName, mcpReqId, mcpResId) {
+    return [
+      "__TOOL_RESULT__",
+      `id: ${mcpResId}`,
+      `req_id: ${mcpReqId}`,
+      `op: ${toolName}`,
+    ].join("\n");
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -532,16 +570,16 @@
       }
     }
 
-    async function callTool(name, args = {}) {
+    async function callTool(name, args = {}, mcpReqId = "") {
       if (!_initialized) throw new Error("MCP not ready");
 
-      // Log: hitting MCP (shown in Tool tab too)
-      toolLog("hit", `📡 HIT MCP: ${name}`, { args });
-      bgLog("mcp", `📤 Calling MCP tool: ${name}`, { args });
+      const reqId = mcpReqId || makeMcpReqId("unknown");
 
-      // Log: waiting
-      toolLog("waiting", `⏳ WAITING for MCP: ${name}`, {});
-      bgLog("mcp", `⌛ Waiting for MCP result: ${name}...`, {});
+      toolLog("hit", `📡 HIT MCP: ${name}`, { id: reqId, args });
+      bgLog("mcp", `📤 Calling MCP tool: ${name}`, { id: reqId, args });
+
+      toolLog("waiting", `⏳ WAITING for MCP: ${name}`, { id: reqId });
+      bgLog("mcp", `⌛ Waiting for MCP result: ${name}...`, { id: reqId });
 
       const result = await Promise.race([
         _send("tools/call", { name, arguments: args }),
@@ -550,18 +588,19 @@
         ),
       ]);
 
+      const mcpResId = makeMcpResId(reqId);
       const text = result?.content?.[0]?.text ?? JSON.stringify(result);
       const ok   = !result?.isError;
 
       if (ok) {
-        toolLog("received", `✅ RECEIVED from MCP: ${name}`, { chars: text.length, preview: text.slice(0, 200) });
-        bgLog("success", `✅ MCP result received: ${name}`, { chars: text.length, preview: text.slice(0, 300) });
+        toolLog("received", `✅ RECEIVED from MCP: ${name}`, { id: mcpResId, req_id: reqId, chars: text.length, preview: text.slice(0, 200) });
+        bgLog("success", `✅ MCP result received: ${name}`, { id: mcpResId, req_id: reqId, chars: text.length, preview: text.slice(0, 300) });
       } else {
-        toolLog("error", `❌ MCP ERROR: ${name}`, { error: text });
-        bgLog("error", `❌ MCP tool error: ${name}`, { error: text });
+        toolLog("error", `❌ MCP ERROR: ${name}`, { id: mcpResId, req_id: reqId, error: text });
+        bgLog("error", `❌ MCP tool error: ${name}`, { id: mcpResId, req_id: reqId, error: text });
       }
 
-      return { ok, text, raw: result };
+      return { ok, text, raw: result, mcpReqId: reqId, mcpResId };
     }
 
     return { connect, callTool, isReady: () => _initialized };
@@ -682,46 +721,44 @@
       if (_seenTexts.has(fp)) return;
       _seenNodes.add(el);
       _seenTexts.add(fp);
-      bgLog("ai", "🤖 AI message detected", { preview: text.length > 300 ? text.slice(0, 300) + "…" : text });
+      const responseId = makeTimeId("resp");
+      bgLog("ai", "🤖 AI message detected", {
+        id: responseId,
+        preview: text.length > 300 ? text.slice(0, 300) + "…" : text,
+      });
     });
 
     for (const line of joined.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("AGENT_CALL")) continue;
-      bgLog("dom", "🔍 DOM: AGENT_CALL detected in AI message", { raw: trimmed.slice(0, 120) });
+
+      const responseId = makeTimeId("resp");
+      bgLog("dom", "🔍 DOM: AGENT_CALL detected in AI message", { id: responseId, raw: trimmed.slice(0, 120) });
+
       const jsonPart = trimmed.replace(/^AGENT_CALL\s*:?\s*/, "");
       let call;
-      try { call = JSON.parse(jsonPart); }
-      catch {
-        bgLog("error", "⚠️ AGENT_CALL JSON parse error — attempting path fix", { line: trimmed });
-        // Try fixing common Windows path issues before giving up
-        const fixed = jsonPart
-          .replace(/\\\\/g, "/")
-          .replace(/\\(?!["\\])/g, "/");
-        try {
-          call = JSON.parse(fixed);
-          bgLog("success", "✅ AGENT_CALL recovered after path fix", { fixed: fixed.slice(0, 120) });
-        } catch {
-          bgLog("error", "❌ AGENT_CALL still unparseable after fix", { line: trimmed });
-          continue;
-        }
+      try {
+        call = JSON.parse(preprocessAgentCallJson(jsonPart));
+      } catch {
+        bgLog("error", "❌ AGENT_CALL JSON parse error — skipped (no retry)", { id: responseId, line: trimmed });
+        continue;
       }
+
       const callFp = JSON.stringify(call);
       if (_processed.has(callFp)) continue;
       _processed.add(callFp);
 
-      // Normalize all path fields in the call
       const normalizedCall = normalizeCallPaths(call);
       if (JSON.stringify(normalizedCall) !== JSON.stringify(call)) {
         bgLog("dom", "🔧 Path normalized (backslash → forward slash)", {
+          id: responseId,
           original: call.path || call.hint || "",
           normalized: normalizedCall.path || normalizedCall.hint || "",
         });
       }
 
-      bgLog("dom", `📬 Queuing tool call: ${normalizedCall.op}`, { call: normalizedCall });
-      enqueueToolCall(normalizedCall);
-      break;
+      bgLog("dom", `📬 Queuing tool call: ${normalizedCall.op}`, { id: responseId, call: normalizedCall });
+      enqueueToolCall(normalizedCall, responseId);
     }
   }
 
@@ -734,7 +771,11 @@
       if (_seenTexts.has(fp)) return;
       _seenNodes.add(el);
       _seenTexts.add(fp);
-      bgLog("user", "👤 User input detected", { message: text.length > 200 ? text.slice(0, 200) + "…" : text });
+      const inputId = makeTimeId("input");
+      bgLog("user", "👤 User input detected", {
+        id: inputId,
+        message: text.length > 200 ? text.slice(0, 200) + "…" : text,
+      });
     });
   }
 
@@ -744,9 +785,10 @@
   const TOOL_QUEUE = [];
   let PROCESSING_QUEUE = false;
 
-  function enqueueToolCall(call) {
-    TOOL_QUEUE.push(call);
-    bgLog("queue", `📥 Enqueued: ${call.op} (queue depth: ${TOOL_QUEUE.length})`, {});
+  function enqueueToolCall(call, responseId) {
+    const item = { call, responseId: responseId || makeTimeId("resp") };
+    TOOL_QUEUE.push(item);
+    bgLog("queue", `📥 Enqueued: ${call.op} (queue depth: ${TOOL_QUEUE.length})`, { id: item.responseId });
     processQueue();
   }
 
@@ -754,22 +796,23 @@
     if (PROCESSING_QUEUE) return;
     PROCESSING_QUEUE = true;
     while (TOOL_QUEUE.length > 0) {
-      const call = TOOL_QUEUE.shift();
-      bgLog("queue", `▶️ Processing: ${call.op} (${TOOL_QUEUE.length} remaining)`, {});
+      const item = TOOL_QUEUE.shift();
+      bgLog("queue", `▶️ Processing: ${item.call.op} (${TOOL_QUEUE.length} remaining)`, { id: item.responseId });
       try {
-        await executeToolCall(call);
+        await executeToolCall(item.call, item.responseId);
       } catch (err) {
-        bgLog("error", `❌ Queue execution error: ${call.op}`, { error: err.message });
+        bgLog("error", `❌ Queue execution error: ${item.call.op}`, { id: item.responseId, error: err.message });
       }
     }
     PROCESSING_QUEUE = false;
     bgLog("queue", "✅ Queue empty — all done", {});
   }
 
-  async function executeToolCall(call) {
+  async function executeToolCall(call, responseId) {
     _busy = true;
+    const mcpReqId = makeMcpReqId(responseId);
     updateStatus(`🔧 ${call.op || call.name}`);
-    bgLog("exec", `🚀 Executing: ${call.op}`, { call });
+    bgLog("exec", `🚀 Executing: ${call.op}`, { id: responseId, mcp_req_id: mcpReqId, call });
 
     const toolName = OP_TO_TOOL[call.op] || call.op || call.name;
     const isCatOp  = NO_CHUNK_OPS.has(call.op);
@@ -778,16 +821,20 @@
     let result;
     const startTime = Date.now();
     try {
-      result = await McpClient.callTool(toolName, args);
+      result = await McpClient.callTool(toolName, args, mcpReqId);
     } catch (err) {
-      result = { ok: false, text: err.message };
-      bgLog("error", `❌ Tool call threw exception: ${toolName}`, { error: err.message });
+      const mcpResId = makeMcpResId(mcpReqId);
+      result = { ok: false, text: err.message, mcpReqId, mcpResId };
+      bgLog("error", `❌ Tool call threw exception: ${toolName}`, { id: mcpResId, req_id: mcpReqId, error: err.message });
     }
 
     addHistory({
       tool: toolName,
       args,
       ok: result.ok,
+      responseId,
+      mcpReqId: result.mcpReqId,
+      mcpResId: result.mcpResId,
       duration: Date.now() - startTime,
       preview: (result.text || "").slice(0, 200),
     });
@@ -796,35 +843,37 @@
     updateCallCount(_callCount);
 
     const resultText = result.ok ? result.text : `ERROR: ${result.text}`;
+    const header = formatToolResultHeader(toolName, result.mcpReqId, result.mcpResId);
 
     if (isCatOp) {
-      // CAT: never chunk — inject full content in one shot
-      bgLog("inject", `📄 cat result: injecting full content (${resultText.length} chars)`, {});
+      bgLog("inject", `📄 cat result: injecting full content (${resultText.length} chars)`, { id: result.mcpResId, req_id: result.mcpReqId });
       updateStatus("⏳ Injecting cat result (full)…");
-      const reply = `__TOOL_RESULT__\nop: ${toolName}\n${resultText}\n__END_RESULT__\n\nContinue based on the result above.`;
+      const reply = `${header}\n${resultText}\n__END_RESULT__\n\nContinue based on the result above.`;
       const sent  = await typeIntoInput(reply, true);
       updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
-      bgLog(sent ? "success" : "error", sent ? `✅ cat inject done` : `❌ cat inject failed`, { chars: reply.length });
+      bgLog(sent ? "success" : "error", sent ? `✅ cat inject done` : `❌ cat inject failed`, { id: result.mcpResId, req_id: result.mcpReqId, chars: reply.length });
     } else {
       const chunks = chunkText(resultText, CHUNK_SIZE);
       if (chunks.length === 1) {
         updateStatus("⏳ Injecting result…");
-        bgLog("inject", `💉 Injecting single-chunk result for ${toolName}`, { chars: resultText.length });
-        const reply = `__TOOL_RESULT__\nop: ${toolName}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
+        bgLog("inject", `💉 Injecting single-chunk result for ${toolName}`, { id: result.mcpResId, req_id: result.mcpReqId, chars: resultText.length });
+        const reply = `${header}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
         const sent  = await typeIntoInput(reply, true);
         updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
-        bgLog(sent ? "success" : "error", sent ? `✅ Inject done` : `❌ Inject failed`, {});
+        bgLog(sent ? "success" : "error", sent ? `✅ Inject done` : `❌ Inject failed`, { id: result.mcpResId, req_id: result.mcpReqId });
       } else {
-        bgLog("inject", `📦 Multi-chunk inject: ${chunks.length} chunks for ${toolName}`, { totalChars: resultText.length });
+        bgLog("inject", `📦 Multi-chunk inject: ${chunks.length} chunks for ${toolName}`, { id: result.mcpResId, req_id: result.mcpReqId, totalChars: resultText.length });
         for (let i = 0; i < chunks.length; i++) {
           updateStatus(`⏳ Injecting chunk ${i + 1}/${chunks.length}…`);
-          bgLog("inject", `📦 Injecting chunk ${i + 1}/${chunks.length}`, { chars: chunks[i].length });
+          bgLog("inject", `📦 Injecting chunk ${i + 1}/${chunks.length}`, { id: result.mcpResId, req_id: result.mcpReqId, chars: chunks[i].length });
           const isLast = i === chunks.length - 1;
-          const header = i === 0 ? `__TOOL_RESULT__\nop: ${toolName}\n` : `[chunk ${i + 1}/${chunks.length}]\n`;
+          const chunkHeader = i === 0
+            ? `${header}\n`
+            : `[chunk ${i + 1}/${chunks.length}] req_id: ${result.mcpReqId}\n`;
           const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
-          const reply  = header + chunks[i] + footer;
+          const reply  = chunkHeader + chunks[i] + footer;
           const sent   = await typeIntoInput(reply, true);
-          if (!sent) { bgLog("error", `❌ Chunk ${i + 1} send failed`, {}); updateStatus("⚠️ Send failed mid-chunk"); break; }
+          if (!sent) { bgLog("error", `❌ Chunk ${i + 1} send failed`, { id: result.mcpResId, req_id: result.mcpReqId }); updateStatus("⚠️ Send failed mid-chunk"); break; }
           if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
         }
         updateStatus("✅ Done (chunked)");
@@ -852,7 +901,8 @@
         const submit = payload.submit ?? true;
         const msgId  = payload.id     ?? null;
         if (!text) return;
-        bgLog("push", "📥 Push message received", { preview: text.slice(0, 80), submit, id: msgId });
+        const pushId = msgId || makeTimeId("push");
+        bgLog("push", "📥 Push message received", { id: pushId, preview: text.slice(0, 80), submit });
         const sent = await typeIntoInput(text, submit);
         try {
           await fetch(PUSH_ACK_URL, {
@@ -1203,7 +1253,7 @@
         return;
       }
       const lines = TOOL_HISTORY.map((h, i) =>
-        `#${i + 1} [${new Date(h.time).toLocaleTimeString()}] ${h.tool} (${h.duration}ms) ${h.ok ? "✅" : "❌"}\n  ${h.preview}`
+        `#${i + 1} [${new Date(h.time).toLocaleTimeString()}] ${h.tool} (${h.duration}ms) ${h.ok ? "✅" : "❌"}\n  resp: ${h.responseId || "?"}\n  req:  ${h.mcpReqId || "?"}\n  res:  ${h.mcpResId || "?"}\n  ${h.preview}`
       ).join("\n\n");
       bgLog("info", `📋 Last ${TOOL_HISTORY.length} tool calls`, { history: lines });
     });

@@ -210,11 +210,4 @@ Turn 4 (after `__TOOL_RESULT__: OK patched`):
 ```
 AGENT_CALL {"op":"run_tests","cmd":"npx tsc --noEmit"}
 ```
-
-Turn 5 (after `__TOOL_RESULT__: no errors`):
-```
-Fixed useHrData.ts — removed invalid `onSuccess: (, variables)` callbacks in two
-mutation hooks. `npx tsc --noEmit` passes with no errors.
-```
-
 # ════════════════════════════════════════════════════════════════════════════

@@ -60,20 +60,46 @@ from fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == "OPTIONS":
-            from starlette.responses import Response
-            response = Response()
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "*"
-            response.headers["Access-Control-Allow-Private-Network"] = "true"
-            return response
-        response = await call_next(request)
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-        return response
+from starlette.types import ASGIApp, Scope, Receive, Send
 
+class PrivateNetworkAccessMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            # Handle PNA preflight
+            if scope["method"] == "OPTIONS":
+                async def send_preflight(message):
+                    if message["type"] == "http.response.start":
+                        headers_list = list(message.get("headers", []))
+                        headers_list += [
+                            (b"access-control-allow-origin",          b"*"),
+                            (b"access-control-allow-methods",         b"GET, POST, OPTIONS"),
+                            (b"access-control-allow-headers",         b"*"),
+                            (b"access-control-allow-private-network", b"true"),
+                        ]
+                        message["headers"] = headers_list
+                    await send(message)
+                await self.app(scope, receive, send_preflight)
+                return
+
+            # Inject PNA header into every response
+            async def send_with_pna(message):
+                if message["type"] == "http.response.start":
+                    headers_list = list(message.get("headers", []))
+                    headers_list.append(
+                        (b"access-control-allow-private-network", b"true")
+                    )
+                    message["headers"] = headers_list
+                await send(message)
+
+            await self.app(scope, receive, send_with_pna)
+        else:
+            # websocket / lifespan — pass through untouched
+            await self.app(scope, receive, send)
+            
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -904,6 +930,24 @@ def project_info() -> str:
     return "\n".join(info)
 
 
+@mcp.tool()
+def rules() -> str:
+    """
+    Return the VibesCode Agent system prompt / rules.
+    
+    Call this at the start of every session to load the full agent rules,
+    tool reference, and behavior guidelines.
+    No parameters required.
+    just type AGENT_CALL {"op":"rules"} to get the full text of the human prompt. Keep it handy for reference!
+    """
+    rules_file = Path(__file__).parent / "system_prompt.txt"
+    if not rules_file.exists():
+        return "ERROR: system_prompt.txt not found next to main.py"
+    try:
+        return rules_file.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"ERROR reading system_prompt.txt: {exc}"
+
 # ── Template / Plan tools ─────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -1027,6 +1071,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(PrivateNetworkAccessMiddleware)
+# Keep your existing CORSMiddleware too
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1034,8 +1081,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(PrivateNetworkAccessMiddleware)
-# Keep your existing CORSMiddleware too
 
 mcp_app = mcp.http_app(transport="sse")
 app.mount("/mcp", mcp_app)

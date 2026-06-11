@@ -455,7 +455,7 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
       if (/^```/.test(l)) return false;
       return l.length > 0;
     });
-    if (proseLines.length) return { ok: false, reason: "prose_mixed" };
+    // if (proseLines.length) return { ok: false, reason: "prose_mixed" };
     return { ok: true, line: agentLines[0] };
   }
 

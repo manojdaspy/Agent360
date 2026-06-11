@@ -1,0 +1,84 @@
+What is template_prompt?
+It's a persistent notepad for the AI agent. Templates are saved to vibescode_templates.json on disk and survive server restarts. The agent can save and load any text — plans, prompts, task checklists — across sessions.
+
+Real Use Cases
+1. Save the system prompt once, load it every new chat
+AGENT_CALL {"op":"template_prompt","action":"save","name":"system/vibescode","tag":"system","content":"You are VibesCode Agent..."}
+Then in any new conversation:
+AGENT_CALL {"op":"template_prompt","action":"get","name":"system/vibescode"}
+2. Save a multi-step task plan at the start of a big feature
+AGENT_CALL {"op":"template_prompt","action":"save","name":"feature/auth-refactor","tag":"plan","content":"## Goal\nRefactor auth to JWT\n## Steps\n1. Read auth.py\n2. Write new jwt.py\n3. Update routes\n4. Run tests"}
+Later, mid-task, load it to remember what's left:
+AGENT_CALL {"op":"template_prompt","action":"get","name":"feature/auth-refactor"}
+3. List all saved plans
+AGENT_CALL {"op":"template_prompt","action":"list","tag":"plan"}
+4. Delete when done
+AGENT_CALL {"op":"template_prompt","action":"delete","name":"feature/auth-refactor"}
+
+Summary
+actionwhat it doessaveStore any text under a namegetLoad it back (in any session)listSee all saved templatesdeleteRemove one
+Think of it as the agent's long-term memory — anything too important to lose between chats gets saved here.Sonnet 4.6 LowClaude is AI and can make mistakes. Please double-check responses.ShareContent// content.js — VibesCode Agent v14
+// ════════════════════════════════════════════════════════════════════════════
+//  ① AI_REQ_RES — single source of truth for every conversation event
+//  ② Per-TURN scanner (Gemini / ChatGPT / Claude DOM) — not joined history
+//  ③ injectGate() — discard stalpastedLoading the script 'https://www.googletagmanager.com/gtm.js?id=GTM-KKRLL9S' violates the following Content Security Policy directive: "script-src 'unsafe-inline' 'unsafe-eval' blob: data: https://www.googleadservices.com/pagead/conversion/ https://www.googletagmanager.com/gtag/js https://www.googletpastedINFO:     127.0.0.1:53890 - "POST /mcp/messages/?session_id=4f75d913cd324c8a8286f80542ef8b3b HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:53891 - "POST /ext/heartbeat HTTP/1.1" 200 OK
+2026-06-11 15:53:17,382 [vibescode] INFO — [push] Client disconnected: nyvrfrp2
+ERROR:    Exception in ASGI applicapasted# ════════════════════════════════════════════════════════════════════════════
+#  VibesCode Agent — System Prompt v13 (FINAL)
+#  Compatible with: ChatGPT · Gemini · Claude · Perplexity · DeepSeek
+#  Bridge: LuckeyVibes extension + MCP server (AGENT_CALL / __TOOL_RESULT__)
+# ═════════════════════pasted
+
+
+---
+
+## ━━ TEMPLATE PROMPT — PERSISTENT MEMORY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+`template_prompt` is the agent's **long-term memory**. Templates are saved to
+disk and survive server restarts. Use them to preserve plans, system prompts,
+and task checklists across sessions.
+
+### When to use
+
+| Situation | Action |
+|-----------|--------|
+| Starting a multi-step feature | `save` a plan with all steps |
+| Resuming work in a new chat | `list` then `get` the saved plan |
+| Storing the system prompt | `save` under `system/vibescode` |
+| Task fully complete | `delete` the plan |
+
+### Rules
+- **Always `list` on session start** — check if a plan exists before asking the user
+- **Save a plan before long tasks** — so any future session can resume without re-explaining
+- **One plan per feature** — name it `feature/<name>` or `task/<name>`
+- **Update the plan** after completing each step — `save` overwrites the old one
+- **Delete when done** — keep the template store clean
+
+### Tags
+| tag | purpose |
+|-----|---------|
+| `plan` | multi-step task checklist |
+| `system` | system prompts |
+| `task` | single focused tasks |
+| `general` | anything else |
+
+### Examples
+
+Save a plan at the start of a feature:
+AGENT_CALL {"op":"template_prompt","action":"save","name":"feature/auth-refactor","tag":"plan","content":"## Goal\nRefactor auth to JWT\n## Steps\n1. Read auth.py\n2. Write jwt.py\n3. Update routes\n4. Run tests\n## Status\nStep 1 done"}
+
+Load it in a new session:
+AGENT_CALL {"op":"template_prompt","action":"get","name":"feature/auth-refactor"}
+
+Update after completing a step:
+AGENT_CALL {"op":"template_prompt","action":"save","name":"feature/auth-refactor","tag":"plan","content":"## Goal\nRefactor auth to JWT\n## Steps\n1. ✅ Read auth.py\n2. ✅ Write jwt.py\n3. Update routes\n4. Run tests\n## Status\nStep 3 in progress"}
+
+List all plans:
+AGENT_CALL {"op":"template_prompt","action":"list","tag":"plan"}
+
+Delete when done:
+AGENT_CALL {"op":"template_prompt","action":"delete","name":"feature/auth-refactor"}
+
+
+AGENT_CALL {"op":"list_mcp_tools"}#list all tools

@@ -1,0 +1,41 @@
+1. new EventSource(...) → bgSSE(...)
+In both connect() and connectPushChannel().
+Why: EventSource opened directly from a content script is treated as coming from https://gemini.google.com (public origin) trying to reach http://localhost (private/loopback). Chrome's Private Network Access policy blocks this regardless of CORS headers.
+bgSSE opens the EventSource from the background service worker instead, which is an extension context — not a public web origin — so PNA doesn't apply.
+
+2. fetch(...) → bgFetch(...) in _send()
+Why: Same reason — the MCP POST calls also go to localhost, same PNA block.
+
+3. fetch(...) → bgFetch(...) for push ACK
+Inside connectPushChannel → onEvent handler.
+Why: Same reason again.
+
+Does it affect other parts?
+No. The changes are purely transport-level:
+
+The MCP protocol logic is identical — same initialize, same tools/call, same JSON-RPC
+The SSE event names (endpoint, message, inject) are the same
+The reconnect/backoff logic is the same
+scanAiMessages, executeToolCall, injectToolResult, the state machine, the panel — none of it was touched
+
+The only thing that changed is who opens the connection — background worker instead of content script. Everything downstream sees exactly the same data as before.
+
+
+
+before it's workable from https.fully workable
+
+(venv) PS C:\Users\luckey\Desktop\nextgen> git add .
+(venv) PS C:\Users\luckey\Desktop\nextgen> git commit -m "fixed local cors policy error"
+[main 6776b57] fixed local cors policy error
+ 5 files changed, 219 insertions(+), 75 deletions(-)
+(venv) PS C:\Users\luckey\Desktop\nextgen> git push
+Enumerating objects: 19, done.
+Counting objects: 100% (19/19), done.
+Delta compression using up to 4 threads
+Compressing objects: 100% (9/9), done.
+Writing objects: 100% (10/10), 10.62 KiB | 1.06 MiB/s, done.
+Total 10 (delta 7), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (7/7), completed with 7 local objects.
+To https://github.com/manojdaspy/nextgen.git
+   9ab4c32..6776b57  main -> main
+(venv) PS C:\Users\luckey\Desktop\nextgen> 

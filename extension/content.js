@@ -245,11 +245,20 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
   }
 
   /** One-pass JSON prep — normalise path backslashes before parse (not a retry). */
-  function preprocessAgentCallJson(jsonPart) {
-    return jsonPart
-      .replace(/\\\\/g, "/")
-      .replace(/\\(?!["\\/bfnrtu])/g, "/");
-  }
+function preprocessAgentCallJson(jsonPart) {
+  // normalize backslash paths
+  jsonPart = jsonPart.replace(/\\\\/g, "/").replace(/\\(?!["\\/bfnrtu])/g, "/");
+
+  // attempt parse — if it works, done
+  try { JSON.parse(jsonPart); return jsonPart; } catch {}
+
+  // extract op first so we know what fields to expect
+  // rebuild the JSON by extracting known string fields safely
+  const opMatch = jsonPart.match(/"op"\s*:\s*"([^"]+)"/);
+  if (!opMatch) return jsonPart; // can't fix, return as-is
+
+  return jsonPart; // fallback
+}
 
   function formatToolResultHeader(toolName, mcpReqId, mcpResId) {
     return [
@@ -1126,12 +1135,32 @@ const McpClient = (() => {
 
     const jsonPart = validation.line.replace(/^AGENT_CALL\s*:?\s*/, "");
     let call;
+    
     try {
       call = JSON.parse(preprocessAgentCallJson(jsonPart));
-    } catch {
+    } catch (parseErr) {
       reqResUpdate(turn.respId, { status: "error", skip_reason: "parse_error", has_call: true });
       _turnState.set(turn.el, { processed: true, status: "parse_error" });
-      bgLog("error", "❌ AGENT_CALL parse error — turn skipped (no retry)", { id: turn.respId, line: validation.line });
+      bgLog("error", "❌ AGENT_CALL parse error — injecting correction", { id: turn.respId });
+
+      const correction = [
+        "__PARSE_ERROR__",
+        "Your last AGENT_CALL could not be parsed as valid JSON.",
+        "Most likely cause: unescaped double quotes inside string values.",
+        "",
+        'Wrong:   "key": "hr"     inside a JSON string value',
+        'Correct: "key": \\"hr\\"   escape inner quotes with \\"',
+        "",
+        "Please reissue the AGENT_CALL with correctly escaped JSON.",
+        "Only the AGENT_CALL line — no explanation.",
+      ].join("\n");
+
+      // fire and forget — scanAiMessages is not async
+      (async () => {
+        setState(SM.INJECTING);
+        await typeIntoInput(correction, true);
+        setState(SM.WAITING_AI);
+      })();
       return;
     }
 

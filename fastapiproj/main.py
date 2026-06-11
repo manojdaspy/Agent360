@@ -56,6 +56,24 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from fastmcp import FastMCP
 
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            from starlette.responses import Response
+            response = Response()
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+            return response
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -1016,6 +1034,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(PrivateNetworkAccessMiddleware)
+# Keep your existing CORSMiddleware too
+
 mcp_app = mcp.http_app(transport="sse")
 app.mount("/mcp", mcp_app)
 
@@ -1278,4 +1299,4 @@ async def list_tools_endpoint() -> dict:
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True, log_level="info")
+    uvicorn.run("main:app", host="127.0.0.1", port=port, reload=True, log_level="info")

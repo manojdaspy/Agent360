@@ -16,7 +16,8 @@
   // ══════════════════════════════════════════════════════════════════════════
   // 0. CONFIG
   // ══════════════════════════════════════════════════════════════════════════
-  const MCP_BASE_URL   = "https://studentassignment.lyralogics.com";
+  // const MCP_BASE_URL   = "https://studentassignment.lyralogics.com";
+  const MCP_BASE_URL   = "http://localhost:8000";
   const MCP_SSE_URL    = `${MCP_BASE_URL}/mcp/sse`;
   const PUSH_SSE_URL   = `${MCP_BASE_URL}/push/stream`;
   const PUSH_ACK_URL   = `${MCP_BASE_URL}/push/ack`;
@@ -154,6 +155,54 @@
   const PLATFORM = PLATFORMS.find(p => p.match(location.hostname));
   console.log("[VibesCode v13+] Platform:", PLATFORM.name);
 
+  // ══════════════════════════════════════════════════════════════════════════
+// 0b. PNA-SAFE FETCH — routes through background service worker
+//     so localhost is reachable from public-origin content scripts
+// ══════════════════════════════════════════════════════════════════════════
+function bgFetch(url, { method = "GET", headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: "FETCH", url, method, headers, body: body ?? null },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          return reject(new Error(chrome.runtime.lastError.message));
+        }
+        if (response?.error) {
+          return reject(new Error(response.error));
+        }
+        // Mimic enough of the fetch Response API that callers work unchanged
+        resolve({
+          ok:     response.ok,
+          status: response.status,
+          text:   () => Promise.resolve(response.body),
+          json:   () => Promise.resolve(JSON.parse(response.body)),
+        });
+      }
+    );
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 0c. PNA-SAFE EventSource — proxied through background service worker
+// ══════════════════════════════════════════════════════════════════════════
+function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {}) {
+  const port = chrome.runtime.connect({ name: "SSE_PROXY" });
+
+  port.postMessage({ type: "OPEN", url, eventNames });
+
+  port.onMessage.addListener((msg) => {
+    if (msg.type === "open"  && onOpen)  onOpen();
+    if (msg.type === "error" && onError) onError();
+    if (msg.type === "event" && onEvent) onEvent(msg.name, msg.data);
+  });
+
+  port.onDisconnect.addListener(() => {
+    if (onError) onError();
+  });
+
+  // Return a close handle so callers can shut it down
+  return { close: () => port.disconnect() };
+}
   // ══════════════════════════════════════════════════════════════════════════
   // PATH NORMALIZATION — fix Windows backslash paths
   // ══════════════════════════════════════════════════════════════════════════
@@ -822,7 +871,7 @@
   // ══════════════════════════════════════════════════════════════════════════
   // 6. MCP CLIENT
   // ══════════════════════════════════════════════════════════════════════════
-  const McpClient = (() => {
+const McpClient = (() => {
     let _sessionPostUrl = null;
     let _pendingCalls   = new Map();
     let _nextId         = 1;
@@ -832,30 +881,38 @@
 
     function connect() {
       bgLog("mcp", "🔌 Connecting to MCP SSE...", { url: MCP_SSE_URL });
-      _sseSource = new EventSource(MCP_SSE_URL);
-      _sseSource.addEventListener("endpoint", async (e) => {
-        const raw = e.data.trim();
-        _sessionPostUrl = raw.startsWith("http")
-          ? raw
-          : MCP_BASE_URL.replace(/\/$/, "") + raw;
-        bgLog("mcp", "📡 MCP session endpoint received", { url: _sessionPostUrl });
-        await _initialize();
+
+      _sseSource = bgSSE(MCP_SSE_URL, {
+        eventNames: ["endpoint", "message"],
+        onOpen: () => {
+          _backoffMs = 1000;
+          bgLog("mcp", "🟢 MCP SSE connection opened", {});
+        },
+        onError: () => {
+          bgLog("error", `❌ MCP SSE error — reconnecting in ${_backoffMs}ms`, {});
+          _sseSource.close();
+          _initialized    = false;
+          _sessionPostUrl = null;
+          updateMcpBadge(false);
+          setTimeout(() => { _backoffMs = Math.min(_backoffMs * 2, 30_000); connect(); }, _backoffMs);
+        },
+        onEvent: (name, data) => {
+          if (name === "endpoint") {
+            const raw = data.trim();
+            _sessionPostUrl = raw.startsWith("http")
+              ? raw
+              : MCP_BASE_URL.replace(/\/$/, "") + raw;
+            bgLog("mcp", "📡 MCP session endpoint received", { url: _sessionPostUrl });
+            _initialize();
+          }
+          if (name === "message") {
+            let msg;
+            try { msg = JSON.parse(data); }
+            catch { bgLog("error", "⚠️ MCP parse error", { raw: data }); return; }
+            _handleRpcResponse(msg);
+          }
+        },
       });
-      _sseSource.addEventListener("message", (e) => {
-        let msg;
-        try { msg = JSON.parse(e.data); }
-        catch { bgLog("error", "⚠️ MCP parse error", { raw: e.data }); return; }
-        _handleRpcResponse(msg);
-      });
-      _sseSource.onerror = () => {
-        bgLog("error", `❌ MCP SSE error — reconnecting in ${_backoffMs}ms`, {});
-        _sseSource.close();
-        _initialized = false;
-        _sessionPostUrl = null;
-        updateMcpBadge(false);
-        setTimeout(() => { _backoffMs = Math.min(_backoffMs * 2, 30_000); connect(); }, _backoffMs);
-      };
-      _sseSource.onopen = () => { _backoffMs = 1000; bgLog("mcp", "🟢 MCP SSE connection opened", {}); };
     }
 
     async function _send(method, params = {}) {
@@ -864,10 +921,10 @@
       const rpc = { jsonrpc: "2.0", id, method, params };
       return new Promise((resolve, reject) => {
         _pendingCalls.set(id, { resolve, reject });
-        fetch(_sessionPostUrl, {
-          method: "POST",
+        bgFetch(_sessionPostUrl, {
+          method:  "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(rpc),
+          body:    JSON.stringify(rpc),
         }).catch(err => { _pendingCalls.delete(id); reject(err); });
       });
     }
@@ -932,7 +989,6 @@
 
     return { connect, callTool, isReady: () => _initialized };
   })();
-
   // ══════════════════════════════════════════════════════════════════════════
   // 7. HEARTBEAT
   // ══════════════════════════════════════════════════════════════════════════
@@ -944,7 +1000,7 @@
       const btnStatus = getSendButtonStatus();
       updateStatusBar(llmState, btnStatus);
       try {
-        await fetch(HEARTBEAT_URL, {
+        await bgFetch(HEARTBEAT_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1283,52 +1339,60 @@
   // ══════════════════════════════════════════════════════════════════════════
   // 12. PUSH CHANNEL
   // ══════════════════════════════════════════════════════════════════════════
-  function connectPushChannel() {
+function connectPushChannel() {
     const url = `${PUSH_SSE_URL}?tab=${TAB_ID}`;
     bgLog("mcp", "📥 Connecting to push channel", { url, tab: TAB_ID });
     let backoff = 1000;
     let es;
+
     function open() {
-      es = new EventSource(url);
-      es.addEventListener("inject", async (e) => {
-        let payload;
-        try { payload = JSON.parse(e.data); }
-        catch { payload = { text: e.data, submit: true }; }
-        const text   = payload.text   ?? "";
-        const submit = payload.submit ?? true;
-        const msgId  = payload.id     ?? null;
-        if (!text) return;
-        const pushId = msgId || makeTimeId("push");
-        reqResPut({ id: pushId, type: "push", text_preview: text.slice(0, 80), submit, status: "queued" });
-        bgLog("push", "📥 Push message received", { id: pushId, preview: text.slice(0, 80), submit });
+      es = bgSSE(url, {
+        eventNames: ["inject"],
+        onOpen: () => {
+          backoff = 1000;
+          bgLog("mcp", "🟢 Push channel connected", {});
+        },
+        onError: () => {
+          bgLog("warn", "⚠️ Push channel SSE error — reconnecting", {});
+          es.close();
+          setTimeout(() => { backoff = Math.min(backoff * 2, 30_000); open(); }, backoff);
+        },
+        onEvent: async (name, data) => {
+          if (name !== "inject") return;
+          let payload;
+          try { payload = JSON.parse(data); }
+          catch { payload = { text: data, submit: true }; }
+          const text   = payload.text   ?? "";
+          const submit = payload.submit ?? true;
+          const msgId  = payload.id     ?? null;
+          if (!text) return;
+          const pushId = msgId || makeTimeId("push");
+          reqResPut({ id: pushId, type: "push", text_preview: text.slice(0, 80), submit, status: "queued" });
+          bgLog("push", "📥 Push message received", { id: pushId, preview: text.slice(0, 80), submit });
 
-        const gate = pushInjectGate();
-        let sent = false;
-        if (!gate.allow) {
-          reqResUpdate(pushId, { status: "skipped", skip_reason: gate.reason });
-          bgLog("warn", `⏭️ Push inject skipped: ${gate.reason}`, { id: pushId, reason: gate.reason });
-        } else {
-          setState(SM.INJECTING);
-          sent = await typeIntoInput(text, submit);
-          reqResUpdate(pushId, { status: sent ? "injected" : "error" });
-          setState(sent ? SM.WAITING_AI : SM.IDLE);
-        }
+          const gate = pushInjectGate();
+          let sent = false;
+          if (!gate.allow) {
+            reqResUpdate(pushId, { status: "skipped", skip_reason: gate.reason });
+            bgLog("warn", `⏭️ Push inject skipped: ${gate.reason}`, { id: pushId, reason: gate.reason });
+          } else {
+            setState(SM.INJECTING);
+            sent = await typeIntoInput(text, submit);
+            reqResUpdate(pushId, { status: sent ? "injected" : "error" });
+            setState(sent ? SM.WAITING_AI : SM.IDLE);
+          }
 
-        try {
-          await fetch(PUSH_ACK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tab: TAB_ID, id: msgId || pushId, sent }),
-          });
-        } catch { }
+          try {
+            await bgFetch(PUSH_ACK_URL, {
+              method:  "POST",
+              headers: { "Content-Type": "application/json" },
+              body:    JSON.stringify({ tab: TAB_ID, id: msgId || pushId, sent }),
+            });
+          } catch { }
+        },
       });
-      es.onerror = () => {
-        bgLog("warn", "⚠️ Push channel SSE error — reconnecting", {});
-        es.close();
-        setTimeout(() => { backoff = Math.min(backoff * 2, 30_000); open(); }, backoff);
-      };
-      es.onopen = () => { backoff = 1000; bgLog("mcp", "🟢 Push channel connected", {}); };
     }
+
     open();
   }
 
@@ -1752,7 +1816,7 @@
     document.getElementById("vbc-tools-btn").addEventListener("click", async e => {
       e.stopPropagation();
       try {
-        const resp = await fetch(`${MCP_BASE_URL}/tools`);
+        const resp = await bgFetch(`${MCP_BASE_URL}/tools`);
         const data = await resp.json();
         const lines = (data.tools || []).map(t => `• ${t.name}: ${t.description}`).join("\n");
         bgLog("info", `🔧 ${data.total} tools registered`, { tools: lines });

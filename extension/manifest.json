@@ -17,7 +17,8 @@
     "https://claude.ai/*",
     "https://gemini.google.com/*",
     "https://perplexity.ai/*",
-    "https://studentassignment.lyralogics.com/*"
+    "https://studentassignment.lyralogics.com/*",
+    "http://localhost:8000/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1,13 +1,14 @@
-// content.js — VibesCode Agent v13 (Final++)
+// content.js — VibesCode Agent v14
 // ════════════════════════════════════════════════════════════════════════════
-// Improvements over v12:
-//   • Background tab — detailed event log for EVERYTHING the agent does
-//   • Tool tab — only shows MCP hit / waiting / received
-//   • Panel is resizable (drag any edge/corner) and hideable (toggle button)
-//   • Traceable IDs on every input/response/MCP req/res
-//   • Parse error → skip (no retry loop)
-//   • All AGENT_CALL lines queued per scan (no break after first)
-//   • cat results are NEVER chunked — full content injected as one message
+//  ① AI_REQ_RES — single source of truth for every conversation event
+//  ② Per-TURN scanner (Gemini / ChatGPT / Claude DOM) — not joined history
+//  ③ injectGate() — discard stale MCP results before inject
+//  ④ State machine: IDLE→CALL_DETECTED→MCP_EXECUTING→INJECTING→WAITING_AI→IDLE
+//  ⑤ Push inject gate (idle + empty input only)
+//  ⑥ isBotTyping 700ms settle window (Gemini stop-btn flicker)
+//  ⑦ Prose+AGENT_CALL validator — reject mixed messages
+//  ⑧ Parse error → skip turn permanently (WeakMap)
+//  ⑨ Trace + Inject panel tabs
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
   "use strict";
@@ -23,9 +24,10 @@
 
   const TAB_ID                = Math.random().toString(36).slice(2, 10);
   const HEARTBEAT_INTERVAL_MS = 2000;
-  const TOOL_CALL_TIMEOUT_MS  = 30_000;
-  // Only ops that are NOT cat will be chunked
-  const CHUNK_SIZE            = 4000;
+  const TOOL_CALL_TIMEOUT_MS    = 30_000;
+  const BOT_TYPING_SETTLE_MS    = 700;
+  const CHUNK_SIZE              = 4000;
+  const MAX_REQ_RES             = 500;
 
   // ══════════════════════════════════════════════════════════════════════════
   // 1. PLATFORM SELECTORS
@@ -48,7 +50,10 @@
         'button[aria-label="Send message"]',
         'button[aria-label="Send prompt"]',
       ],
-      chatRoot: 'main',
+      chatRoot: '#thread, main',
+      aiTurn:   'section[data-turn="assistant"]',
+      userTurn: 'section[data-turn="user"]',
+      aiText:   '.markdown',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
@@ -69,7 +74,10 @@
         'button[type="submit"]',
         '[data-testid="send-button"]',
       ],
-      chatRoot: '[data-testid="conversation-turn-list"]',
+      chatRoot: '[data-autoscroll-container], main',
+      aiTurn:   '[data-is-streaming="false"], [data-is-streaming]',
+      userTurn: '[data-testid="user-message"]',
+      aiText:   '.standard-markdown, .font-claude-response-body',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
@@ -93,7 +101,12 @@
         '.send-button',
         'button[type="submit"]',
       ],
-      chatRoot: 'chat-history',
+      chatRoot: 'infinite-scroller.chat-history, [data-test-id="chat-history-container"], infinite-scroller',
+      turnContainer: 'div.conversation-container',
+      aiTurn:   'model-response',
+      userTurn: 'user-query',
+      aiText:   '.markdown, .markdown-main-panel',
+      userText: '.query-text, .query-text-line, user-query-content .query-text',
       sendKeys: [
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: false },
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: true },
@@ -199,6 +212,230 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // AI_REQ_RES — single source of truth
+  // ══════════════════════════════════════════════════════════════════════════
+  const AI_REQ_RES = Object.create(null);
+  const AI_REQ_RES_ORDER = [];
+
+  function reqResPut(entry) {
+    AI_REQ_RES[entry.id] = { ...entry, timestamp: entry.timestamp || Date.now() };
+    if (!AI_REQ_RES_ORDER.includes(entry.id)) AI_REQ_RES_ORDER.push(entry.id);
+    while (AI_REQ_RES_ORDER.length > MAX_REQ_RES) {
+      const old = AI_REQ_RES_ORDER.shift();
+      delete AI_REQ_RES[old];
+    }
+    updateTracePanel();
+  }
+
+  function reqResUpdate(id, patch) {
+    if (!AI_REQ_RES[id]) return;
+    Object.assign(AI_REQ_RES[id], patch);
+    updateTracePanel();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // STATE MACHINE
+  // ══════════════════════════════════════════════════════════════════════════
+  const SM = {
+    IDLE:           "IDLE",
+    CALL_DETECTED:  "CALL_DETECTED",
+    MCP_EXECUTING:  "MCP_EXECUTING",
+    INJECTING:      "INJECTING",
+    WAITING_AI:     "WAITING_AI",
+  };
+  let _state = SM.IDLE;
+
+  function setState(next) {
+    _state = next;
+    const el = document.getElementById("vbc-sm-state");
+    if (el) { el.textContent = `SM: ${next}`; el.style.color = next === SM.IDLE ? "#a6e3a1" : "#89b4fa"; }
+  }
+
+  function canScan() {
+    return _state === SM.IDLE || _state === SM.WAITING_AI;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TURN REGISTRY — per DOM turn, not global dedup
+  // ══════════════════════════════════════════════════════════════════════════
+  const _domIdMap     = new WeakMap();
+  const _turnState    = new WeakMap();
+  const _seenHumanIds = new Set();
+  let   _lastHumanId  = null;
+
+  function getDomId(el, prefix = "turn") {
+    if (!el) return makeTimeId(prefix);
+    if (_domIdMap.has(el)) return _domIdMap.get(el);
+    const fromDom =
+      el.id ||
+      el.getAttribute("data-turn-id") ||
+      el.getAttribute("data-message-id") ||
+      el.getAttribute("data-turn-id-container") ||
+      null;
+    const id = fromDom || makeTimeId(prefix);
+    _domIdMap.set(el, id);
+    return id;
+  }
+
+  function getHumanTurnInfos() {
+    const out = [];
+
+    if (PLATFORM.name === "Gemini" && PLATFORM.turnContainer) {
+      const containers = $$(PLATFORM.turnContainer, document);
+      if (containers.length) {
+        for (const c of containers) {
+          const user = $(PLATFORM.userTurn, c);
+          if (!user) continue;
+          const textEl = $(PLATFORM.userText || ".query-text", user) || $(".query-text-line", user) || user;
+          const text = (textEl.innerText || "").trim();
+          if (!text.length) continue;
+          const domId = getDomId(c, "human");
+          out.push({ el: user, container: c, domId, humanId: `human-${domId}`, text });
+        }
+        return out;
+      }
+    }
+
+    if (PLATFORM.name === "ChatGPT" && PLATFORM.userTurn) {
+      for (const sec of $$(PLATFORM.userTurn, document)) {
+        const textEl = $(".whitespace-pre-wrap", sec) || $('[data-message-author-role="user"]', sec) || sec;
+        const text = (textEl.innerText || "").trim();
+        if (!text.length) continue;
+        const domId = getDomId(sec, "human");
+        out.push({ el: sec, container: sec, domId, humanId: `human-${domId}`, text });
+      }
+      return out;
+    }
+
+    if (PLATFORM.name === "Claude" && PLATFORM.userTurn) {
+      for (const msg of $$(PLATFORM.userTurn, document)) {
+        const text = (msg.innerText || "").trim();
+        if (!text.length) continue;
+        const container = msg.closest(".group") || msg;
+        const domId = getDomId(container, "human");
+        out.push({ el: msg, container, domId, humanId: `human-${domId}`, text });
+      }
+      return out;
+    }
+
+    for (const el of $$(PLATFORM.userMsg, document)) {
+      const text = (el.innerText || "").trim();
+      if (!text.length) continue;
+      const domId = getDomId(el, "human");
+      out.push({ el, container: el, domId, humanId: `human-${domId}`, text });
+    }
+    return out;
+  }
+
+  function getAiTurnInfos() {
+    const root = getScanRoot().el;
+    const out = [];
+
+    if (PLATFORM.name === "Gemini" && PLATFORM.turnContainer) {
+      const containers = $$(PLATFORM.turnContainer, document);
+      if (containers.length) {
+        for (const c of containers) {
+          const ai = $(PLATFORM.aiTurn, c);
+          if (!ai) continue;
+          const textEl = $(PLATFORM.aiText, ai) || ai;
+          const text = (textEl.innerText || "").trim();
+          if (!text.length) continue;
+          const domId = getDomId(c, "turn");
+          out.push({ el: ai, container: c, domId, respId: `resp-${domId}`, text, textEl });
+        }
+        return out;
+      }
+    }
+
+    if (PLATFORM.name === "ChatGPT" && PLATFORM.aiTurn) {
+      for (const sec of $$(PLATFORM.aiTurn, document)) {
+        const textEl = $(PLATFORM.aiText, sec) || $(".markdown", sec) || sec;
+        const text = (textEl.innerText || "").trim();
+        if (text.length < 2) continue;
+        const domId = getDomId(sec, "turn");
+        out.push({ el: sec, container: sec, domId, respId: `resp-${domId}`, text, textEl });
+      }
+      return out;
+    }
+
+    if (PLATFORM.name === "Claude" && PLATFORM.aiTurn) {
+      const seen = new WeakSet();
+      for (const block of $$(".font-claude-response.relative, [data-is-streaming]", document)) {
+        if (seen.has(block)) continue;
+        const textEl = $(PLATFORM.aiText, block) || block;
+        const text = (textEl.innerText || "").trim();
+        if (text.length < 2) continue;
+        seen.add(block);
+        const domId = getDomId(block, "turn");
+        out.push({ el: block, container: block, domId, respId: `resp-${domId}`, text, textEl });
+      }
+      return out;
+    }
+
+    for (const el of $$(PLATFORM.aiMsg, document)) {
+      const text = (el.innerText || "").trim();
+      if (!text.length) continue;
+      const domId = getDomId(el, "turn");
+      out.push({ el, container: el, domId, respId: `resp-${domId}`, text, textEl: el });
+    }
+    return out;
+  }
+
+  function getLastAiTurnId() {
+    const turns = getAiTurnInfos();
+    return turns.length ? turns[turns.length - 1].respId : null;
+  }
+
+  function getLatestUnprocessedAiTurn() {
+    const turns = getAiTurnInfos();
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i];
+      const st = _turnState.get(t.el);
+      if (!st || !st.processed) return t;
+    }
+    return null;
+  }
+
+  function validateAgentCallMessage(text) {
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const agentLines = lines.filter(l => l.startsWith("AGENT_CALL"));
+    if (!agentLines.length) return { ok: false, reason: "no_call" };
+    if (agentLines.length > 1) return { ok: false, reason: "multiple_calls" };
+    const proseLines = lines.filter(l => {
+      if (l.startsWith("AGENT_CALL")) return false;
+      if (/^```/.test(l)) return false;
+      return l.length > 0;
+    });
+    if (proseLines.length) return { ok: false, reason: "prose_mixed" };
+    return { ok: true, line: agentLines[0] };
+  }
+
+  function injectGate(mcpResEntry) {
+    const lastTurnId = getLastAiTurnId();
+    if (lastTurnId && mcpResEntry.parent_resp_id && mcpResEntry.parent_resp_id !== lastTurnId) {
+      return { allow: false, reason: "stale — AI moved to new turn" };
+    }
+    if (isBotTyping()) {
+      return { allow: false, reason: "bot typing" };
+    }
+    if (!isInputEmpty()) {
+      return { allow: false, reason: "input not empty" };
+    }
+    const newerPending = TOOL_QUEUE.some(q => q.responseId === mcpResEntry.parent_resp_id);
+    if (newerPending) {
+      return { allow: false, reason: "newer mcp_req pending for same turn" };
+    }
+    return { allow: true, reason: "ok" };
+  }
+
+  function pushInjectGate() {
+    if (_state !== SM.IDLE) return { allow: false, reason: `state=${_state}` };
+    if (isBotTyping()) return { allow: false, reason: "bot typing" };
+    if (!isInputEmpty()) return { allow: false, reason: "input not empty" };
+    return { allow: true, reason: "ok" };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 2. DOM HELPERS
   // ══════════════════════════════════════════════════════════════════════════
   const $  = (sel, root = document) => { try { return root.querySelector(sel); } catch { return null; } };
@@ -263,7 +500,76 @@
     return "not_found";
   };
 
-  const getChatRoot = () => $(PLATFORM.chatRoot) || $('main') || document.body;
+  let _scanRootSel = "body";
+
+  function getScanRoot() {
+    const candidates = [
+      ...(PLATFORM.chatRoot || "").split(",").map(s => s.trim()),
+      "infinite-scroller.chat-history",
+      "[data-test-id='chat-history-container']",
+      "infinite-scroller",
+      "#thread",
+      "main",
+      "body",
+    ].filter(Boolean);
+    const seen = new Set();
+    for (const sel of candidates) {
+      if (seen.has(sel)) continue;
+      seen.add(sel);
+      const el = $(sel);
+      if (el) {
+        _scanRootSel = sel;
+        return { el, sel };
+      }
+    }
+    _scanRootSel = "body";
+    return { el: document.body, sel: "body" };
+  }
+
+  const getChatRoot = () => getScanRoot().el;
+
+  function probeSelectors() {
+    const probes = {
+      chat_root: _scanRootSel,
+      turn_container: PLATFORM.turnContainer ? $$(PLATFORM.turnContainer, document).length : 0,
+      user_turn: PLATFORM.userTurn ? $$(PLATFORM.userTurn, document).length : 0,
+      ai_turn: PLATFORM.aiTurn ? $$(PLATFORM.aiTurn, document).length : 0,
+      ai_text: PLATFORM.aiText ? $$(PLATFORM.aiText, document).length : 0,
+      user_msg_fallback: $$(PLATFORM.userMsg, document).length,
+      ai_msg_fallback: $$(PLATFORM.aiMsg, document).length,
+      input: !!getInput(),
+      send_btn: getSendButtonStatus(),
+      bot_typing: isBotTypingRaw(),
+      input_empty: isInputEmpty(),
+      llm_state: deriveLlmState(),
+      sm_state: _state,
+      mcp_ready: McpClient.isReady(),
+      humans_found: getHumanTurnInfos().length,
+      ai_found: getAiTurnInfos().length,
+      last_human_id: _lastHumanId,
+      last_ai_turn: getLastAiTurnId(),
+    };
+    return probes;
+  }
+
+  function runDomDiagnostics(label = "DOM Diagnostics") {
+    const probes = probeSelectors();
+    const missing = [];
+    if (!probes.turn_container && PLATFORM.turnContainer) missing.push(`turn_container (${PLATFORM.turnContainer})`);
+    if (!probes.user_turn && !probes.user_msg_fallback) missing.push(`user_turn (${PLATFORM.userTurn || PLATFORM.userMsg})`);
+    if (!probes.ai_turn && !probes.ai_msg_fallback) missing.push(`ai_turn (${PLATFORM.aiTurn || PLATFORM.aiMsg})`);
+    if (!probes.input) missing.push(`input (${PLATFORM.input})`);
+    if (probes.send_btn === "not_found") missing.push("send_button");
+    log("info", `🩺 ${label}`, { ...probes, missing: missing.length ? missing : "none" });
+    bgLog("dom", `🩺 ${label}`, { ...probes, missing: missing.length ? missing : "none" });
+    return probes;
+  }
+
+  function runScanCycle(source = "scan") {
+    scanUserMessages();
+    scanAiMessages();
+    if (source === "poll") return;
+  }
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -271,15 +577,35 @@
     return r.width > 0 && r.height > 0 && window.getComputedStyle(el).visibility !== 'hidden';
   };
 
-  const isBotTyping = () => !!(
-    $('button[aria-label="Stop response"]') ||
-    $('button[aria-label="Stop generating"]') ||
-    $('[data-testid="stop-button"]') ||
-    $('.stop-button') ||
-    $('[aria-label="Stop"]') ||
-    $('loading-indicator:not([hidden])') ||
-    $('.loading-indicator-container:not([hidden])')
-  );
+  let _lastTypingAt = 0;
+  let _wasTyping    = false;
+
+  function isBotTypingRaw() {
+    return !!(
+      $('button[aria-label="Stop response"]') ||
+      $('button[aria-label="Stop generating"]') ||
+      $('[data-testid="stop-button"]') ||
+      $('.stop-button') ||
+      $('[aria-label="Stop"]') ||
+      $('[data-is-streaming="true"]') ||
+      $('loading-indicator:not([hidden])') ||
+      $('.loading-indicator-container:not([hidden])') ||
+      $('.processing-state-visible[aria-busy="true"]')
+    );
+  }
+
+  function isBotTyping() {
+    const now = Date.now();
+    const typing = isBotTypingRaw();
+    if (typing) {
+      _wasTyping = true;
+      _lastTypingAt = now;
+      return true;
+    }
+    if (_wasTyping && now - _lastTypingAt < BOT_TYPING_SETTLE_MS) return true;
+    _wasTyping = false;
+    return false;
+  }
 
   const isInputEmpty = () => {
     const input = getInput();
@@ -289,7 +615,8 @@
   };
 
   const deriveLlmState = () => {
-    if (_busy) return "injecting";
+    if (_state === SM.INJECTING || _busy) return "injecting";
+    if (_state === SM.MCP_EXECUTING) return "injecting";
     if (isBotTyping()) return "generating";
     const btnStatus = getSendButtonStatus();
     const empty = isInputEmpty();
@@ -692,91 +1019,107 @@
     cat_range: "cat_range",
   };
 
-  const _seenNodes = new WeakSet();
-  const _seenTexts = new Set();
-  const _processed = (() => {
-    const MAX = 500;
-    const s = new Set();
-    return {
-      has: k => s.has(k),
-      add: k => { if (s.size >= MAX) s.delete(s.values().next().value); s.add(k); },
-    };
-  })();
-
   let _busy      = false;
   let _callCount = 0;
 
+  function registerAiTurn(turn) {
+    if (AI_REQ_RES[turn.respId]) return;
+    reqResPut({
+      id: turn.respId,
+      type: "ai_response",
+      parent_id: _lastHumanId,
+      turn_dom_id: turn.domId,
+      has_call: false,
+      status: "detected",
+      text_preview: turn.text.slice(0, 200),
+    });
+    const preview = turn.text.length > 300 ? turn.text.slice(0, 300) + "…" : turn.text;
+    log("ai", "🤖 AI turn detected", { id: turn.respId, turn_dom: turn.domId, preview });
+    bgLog("ai", "🤖 AI turn detected", { id: turn.respId, turn_dom: turn.domId, preview });
+  }
+
   function scanAiMessages() {
+    if (_state === SM.WAITING_AI && isBotTypingRaw()) setState(SM.IDLE);
+    if (!canScan()) return;
     if (isBotTyping()) return;
 
-    const nodes  = $$(PLATFORM.aiMsg);
-    const joined = nodes.map(el => (el.innerText || "").trim()).join("\n");
-    if (!joined) return;
+    for (const turn of getAiTurnInfos()) registerAiTurn(turn);
 
-    nodes.forEach(el => {
-      if (_seenNodes.has(el)) return;
-      const text = (el.innerText || "").trim();
-      if (!text || text.length < 4) return;
-      const fp = "a:" + text.slice(0, 200);
-      if (_seenTexts.has(fp)) return;
-      _seenNodes.add(el);
-      _seenTexts.add(fp);
-      const responseId = makeTimeId("resp");
-      bgLog("ai", "🤖 AI message detected", {
-        id: responseId,
-        preview: text.length > 300 ? text.slice(0, 300) + "…" : text,
-      });
+    const turn = getLatestUnprocessedAiTurn();
+    if (!turn) return;
+
+    const prev = _turnState.get(turn.el) || {};
+    if (prev.processed) return;
+    if (prev.status === "executing" || prev.status === "queued") return;
+
+    const validation = validateAgentCallMessage(turn.text);
+    if (!validation.ok) {
+      const status = validation.reason === "no_call" ? "no_call" : "skipped";
+      reqResUpdate(turn.respId, { status, skip_reason: validation.reason, has_call: false });
+      _turnState.set(turn.el, { processed: true, status });
+      if (validation.reason === "no_call") {
+        log("ai", "🤖 AI turn (no AGENT_CALL)", { id: turn.respId, preview: turn.text.slice(0, 120) });
+      } else {
+        log("skip", `⏭️ AI turn skipped: ${validation.reason}`, { id: turn.respId, reason: validation.reason });
+        bgLog("warn", `⏭️ AI turn skipped: ${validation.reason}`, { id: turn.respId, reason: validation.reason });
+      }
+      return;
+    }
+
+    bgLog("dom", "🔍 AGENT_CALL in latest AI turn", { id: turn.respId, raw: validation.line.slice(0, 120) });
+
+    const jsonPart = validation.line.replace(/^AGENT_CALL\s*:?\s*/, "");
+    let call;
+    try {
+      call = JSON.parse(preprocessAgentCallJson(jsonPart));
+    } catch {
+      reqResUpdate(turn.respId, { status: "error", skip_reason: "parse_error", has_call: true });
+      _turnState.set(turn.el, { processed: true, status: "parse_error" });
+      bgLog("error", "❌ AGENT_CALL parse error — turn skipped (no retry)", { id: turn.respId, line: validation.line });
+      return;
+    }
+
+    const normalizedCall = normalizeCallPaths(call);
+    const mcpReqId = makeMcpReqId(turn.respId);
+
+    reqResUpdate(turn.respId, {
+      has_call: true,
+      op: normalizedCall.op,
+      status: "queued",
+      mcp_req_id: mcpReqId,
+    });
+    const { op: _callOp, name: _callName, ...mcpArgs } = normalizedCall;
+    reqResPut({
+      id: mcpReqId,
+      type: "mcp_req",
+      parent_resp_id: turn.respId,
+      tool: OP_TO_TOOL[normalizedCall.op] || normalizedCall.op,
+      args: mcpArgs,
+      status: "queued",
     });
 
-    for (const line of joined.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("AGENT_CALL")) continue;
-
-      const responseId = makeTimeId("resp");
-      bgLog("dom", "🔍 DOM: AGENT_CALL detected in AI message", { id: responseId, raw: trimmed.slice(0, 120) });
-
-      const jsonPart = trimmed.replace(/^AGENT_CALL\s*:?\s*/, "");
-      let call;
-      try {
-        call = JSON.parse(preprocessAgentCallJson(jsonPart));
-      } catch {
-        bgLog("error", "❌ AGENT_CALL JSON parse error — skipped (no retry)", { id: responseId, line: trimmed });
-        continue;
-      }
-
-      const callFp = JSON.stringify(call);
-      if (_processed.has(callFp)) continue;
-      _processed.add(callFp);
-
-      const normalizedCall = normalizeCallPaths(call);
-      if (JSON.stringify(normalizedCall) !== JSON.stringify(call)) {
-        bgLog("dom", "🔧 Path normalized (backslash → forward slash)", {
-          id: responseId,
-          original: call.path || call.hint || "",
-          normalized: normalizedCall.path || normalizedCall.hint || "",
-        });
-      }
-
-      bgLog("dom", `📬 Queuing tool call: ${normalizedCall.op}`, { id: responseId, call: normalizedCall });
-      enqueueToolCall(normalizedCall, responseId);
-    }
+    _turnState.set(turn.el, { processed: false, status: "queued", mcp_req_id: mcpReqId });
+    setState(SM.CALL_DETECTED);
+    bgLog("dom", `📬 Queuing: ${normalizedCall.op}`, { id: turn.respId, mcp_req_id: mcpReqId, call: normalizedCall });
+    enqueueToolCall(normalizedCall, turn.respId, mcpReqId, turn.el);
   }
 
   function scanUserMessages() {
-    $$(PLATFORM.userMsg).forEach(el => {
-      if (_seenNodes.has(el)) return;
-      const text = (el.innerText || "").trim();
-      if (!text || text.length < 2) return;
-      const fp = "u:" + text.slice(0, 200);
-      if (_seenTexts.has(fp)) return;
-      _seenNodes.add(el);
-      _seenTexts.add(fp);
-      const inputId = makeTimeId("input");
-      bgLog("user", "👤 User input detected", {
-        id: inputId,
-        message: text.length > 200 ? text.slice(0, 200) + "…" : text,
+    for (const human of getHumanTurnInfos()) {
+      if (_seenHumanIds.has(human.humanId)) continue;
+      _seenHumanIds.add(human.humanId);
+      _lastHumanId = human.humanId;
+      reqResPut({
+        id: human.humanId,
+        type: "human",
+        turn_dom_id: human.domId,
+        text_preview: human.text.slice(0, 200),
+        status: "detected",
       });
-    });
+      const msg = human.text.length > 200 ? human.text.slice(0, 200) + "…" : human.text;
+      log("user", "👤 User turn detected", { id: human.humanId, turn_dom: human.domId, message: msg });
+      bgLog("user", "👤 User turn detected", { id: human.humanId, turn_dom: human.domId, message: msg });
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -785,10 +1128,16 @@
   const TOOL_QUEUE = [];
   let PROCESSING_QUEUE = false;
 
-  function enqueueToolCall(call, responseId) {
-    const item = { call, responseId: responseId || makeTimeId("resp") };
+  function enqueueToolCall(call, responseId, mcpReqId, turnEl) {
+    const item = {
+      call,
+      responseId: responseId || makeTimeId("resp"),
+      mcpReqId: mcpReqId || makeMcpReqId(responseId),
+      turnEl,
+    };
     TOOL_QUEUE.push(item);
-    bgLog("queue", `📥 Enqueued: ${call.op} (queue depth: ${TOOL_QUEUE.length})`, { id: item.responseId });
+    reqResUpdate(item.mcpReqId, { status: "queued" });
+    bgLog("queue", `📥 Enqueued: ${call.op} (depth: ${TOOL_QUEUE.length})`, { id: item.responseId, mcp_req_id: item.mcpReqId });
     processQueue();
   }
 
@@ -797,25 +1146,97 @@
     PROCESSING_QUEUE = true;
     while (TOOL_QUEUE.length > 0) {
       const item = TOOL_QUEUE.shift();
-      bgLog("queue", `▶️ Processing: ${item.call.op} (${TOOL_QUEUE.length} remaining)`, { id: item.responseId });
+      bgLog("queue", `▶️ Processing: ${item.call.op} (${TOOL_QUEUE.length} left)`, { id: item.responseId, mcp_req_id: item.mcpReqId });
       try {
-        await executeToolCall(item.call, item.responseId);
+        await executeToolCall(item);
       } catch (err) {
-        bgLog("error", `❌ Queue execution error: ${item.call.op}`, { id: item.responseId, error: err.message });
+        bgLog("error", `❌ Queue error: ${item.call.op}`, { id: item.responseId, error: err.message });
+        setState(SM.IDLE);
       }
     }
     PROCESSING_QUEUE = false;
-    bgLog("queue", "✅ Queue empty — all done", {});
+    if (_state !== SM.WAITING_AI) setState(SM.IDLE);
+    bgLog("queue", "✅ Queue empty", {});
   }
 
-  async function executeToolCall(call, responseId) {
+  async function injectToolResult(item, toolName, result, resultText) {
+    const header = formatToolResultHeader(toolName, result.mcpReqId, result.mcpResId);
+    const isCatOp = NO_CHUNK_OPS.has(item.call.op);
+    const mcpResEntry = {
+      id: result.mcpResId,
+      parent_resp_id: item.responseId,
+      parent_req_id: result.mcpReqId,
+    };
+
+    const gate = injectGate(mcpResEntry);
+    if (!gate.allow) {
+      reqResUpdate(result.mcpResId, { status: "skipped", skip_reason: gate.reason });
+      reqResUpdate(item.responseId, { status: "skipped", inject_skip: gate.reason });
+      if (item.turnEl) _turnState.set(item.turnEl, { processed: true, status: "skipped" });
+      bgLog("warn", `⏭️ Inject skipped: ${gate.reason}`, { id: result.mcpResId, req_id: result.mcpReqId, reason: gate.reason });
+      injectLog("skip", `⏭️ Inject skipped: ${gate.reason}`, { id: result.mcpResId, req_id: result.mcpReqId });
+      setState(SM.IDLE);
+      return false;
+    }
+
+    setState(SM.INJECTING);
     _busy = true;
-    const mcpReqId = makeMcpReqId(responseId);
+
+    if (isCatOp) {
+      injectLog("inject", `📄 Injecting cat (${resultText.length} chars)`, { id: result.mcpResId, req_id: result.mcpReqId });
+      const reply = `${header}\n${resultText}\n__END_RESULT__\n\nContinue based on the result above.`;
+      const sent = await typeIntoInput(reply, true);
+      if (sent) {
+        reqResUpdate(result.mcpResId, { status: "injected" });
+        reqResUpdate(item.responseId, { status: "injected" });
+        if (item.turnEl) _turnState.set(item.turnEl, { processed: true, status: "done" });
+      }
+      bgLog(sent ? "success" : "error", sent ? "✅ cat inject done" : "❌ cat inject failed", { id: result.mcpResId, req_id: result.mcpReqId });
+      setState(sent ? SM.WAITING_AI : SM.IDLE);
+      _busy = false;
+      return sent;
+    }
+
+    const chunks = chunkText(resultText, CHUNK_SIZE);
+    let allSent = true;
+    for (let i = 0; i < chunks.length; i++) {
+      const g2 = injectGate(mcpResEntry);
+      if (!g2.allow) {
+        bgLog("warn", `⏭️ Chunk inject aborted: ${g2.reason}`, { id: result.mcpResId });
+        allSent = false;
+        break;
+      }
+      const isLast = i === chunks.length - 1;
+      const chunkHeader = i === 0 ? `${header}\n` : `[chunk ${i + 1}/${chunks.length}] req_id: ${result.mcpReqId}\n`;
+      const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
+      const reply = chunkHeader + chunks[i] + footer;
+      injectLog("inject", `📦 Chunk ${i + 1}/${chunks.length}`, { id: result.mcpResId, chars: chunks[i].length });
+      const sent = await typeIntoInput(reply, true);
+      if (!sent) { allSent = false; break; }
+      if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
+    }
+
+    if (allSent) {
+      reqResUpdate(result.mcpResId, { status: "injected" });
+      reqResUpdate(item.responseId, { status: "injected" });
+      if (item.turnEl) _turnState.set(item.turnEl, { processed: true, status: "done" });
+    }
+    setState(allSent ? SM.WAITING_AI : SM.IDLE);
+    _busy = false;
+    return allSent;
+  }
+
+  async function executeToolCall(item) {
+    const { call, responseId, mcpReqId, turnEl } = item;
+    setState(SM.MCP_EXECUTING);
+    _busy = true;
     updateStatus(`🔧 ${call.op || call.name}`);
+    reqResUpdate(mcpReqId, { status: "executing" });
+    reqResUpdate(responseId, { status: "executing" });
+    if (turnEl) _turnState.set(turnEl, { processed: false, status: "executing", mcp_req_id: mcpReqId });
     bgLog("exec", `🚀 Executing: ${call.op}`, { id: responseId, mcp_req_id: mcpReqId, call });
 
     const toolName = OP_TO_TOOL[call.op] || call.op || call.name;
-    const isCatOp  = NO_CHUNK_OPS.has(call.op);
     const { op, name: _n, ...args } = call;
 
     let result;
@@ -825,8 +1246,21 @@
     } catch (err) {
       const mcpResId = makeMcpResId(mcpReqId);
       result = { ok: false, text: err.message, mcpReqId, mcpResId };
-      bgLog("error", `❌ Tool call threw exception: ${toolName}`, { id: mcpResId, req_id: mcpReqId, error: err.message });
+      bgLog("error", `❌ Tool exception: ${toolName}`, { id: mcpResId, req_id: mcpReqId, error: err.message });
     }
+
+    reqResPut({
+      id: result.mcpResId,
+      type: "mcp_res",
+      parent_req_id: mcpReqId,
+      parent_resp_id: responseId,
+      ok: result.ok,
+      chars: (result.text || "").length,
+      status: "received",
+      preview: (result.text || "").slice(0, 200),
+    });
+    reqResUpdate(mcpReqId, { status: "done", mcp_res_id: result.mcpResId });
+    reqResUpdate(responseId, { mcp_res_id: result.mcpResId });
 
     addHistory({
       tool: toolName,
@@ -843,44 +1277,7 @@
     updateCallCount(_callCount);
 
     const resultText = result.ok ? result.text : `ERROR: ${result.text}`;
-    const header = formatToolResultHeader(toolName, result.mcpReqId, result.mcpResId);
-
-    if (isCatOp) {
-      bgLog("inject", `📄 cat result: injecting full content (${resultText.length} chars)`, { id: result.mcpResId, req_id: result.mcpReqId });
-      updateStatus("⏳ Injecting cat result (full)…");
-      const reply = `${header}\n${resultText}\n__END_RESULT__\n\nContinue based on the result above.`;
-      const sent  = await typeIntoInput(reply, true);
-      updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
-      bgLog(sent ? "success" : "error", sent ? `✅ cat inject done` : `❌ cat inject failed`, { id: result.mcpResId, req_id: result.mcpReqId, chars: reply.length });
-    } else {
-      const chunks = chunkText(resultText, CHUNK_SIZE);
-      if (chunks.length === 1) {
-        updateStatus("⏳ Injecting result…");
-        bgLog("inject", `💉 Injecting single-chunk result for ${toolName}`, { id: result.mcpResId, req_id: result.mcpReqId, chars: resultText.length });
-        const reply = `${header}\n${chunks[0]}\n__END_RESULT__\n\nContinue based on the result above.`;
-        const sent  = await typeIntoInput(reply, true);
-        updateStatus(sent ? "✅ Done" : "⚠️ Send failed");
-        bgLog(sent ? "success" : "error", sent ? `✅ Inject done` : `❌ Inject failed`, { id: result.mcpResId, req_id: result.mcpReqId });
-      } else {
-        bgLog("inject", `📦 Multi-chunk inject: ${chunks.length} chunks for ${toolName}`, { id: result.mcpResId, req_id: result.mcpReqId, totalChars: resultText.length });
-        for (let i = 0; i < chunks.length; i++) {
-          updateStatus(`⏳ Injecting chunk ${i + 1}/${chunks.length}…`);
-          bgLog("inject", `📦 Injecting chunk ${i + 1}/${chunks.length}`, { id: result.mcpResId, req_id: result.mcpReqId, chars: chunks[i].length });
-          const isLast = i === chunks.length - 1;
-          const chunkHeader = i === 0
-            ? `${header}\n`
-            : `[chunk ${i + 1}/${chunks.length}] req_id: ${result.mcpReqId}\n`;
-          const footer = isLast ? `\n__END_RESULT__\n\nContinue based on the result above.` : `\n[more chunks follow — wait for __END_RESULT__]`;
-          const reply  = chunkHeader + chunks[i] + footer;
-          const sent   = await typeIntoInput(reply, true);
-          if (!sent) { bgLog("error", `❌ Chunk ${i + 1} send failed`, { id: result.mcpResId, req_id: result.mcpReqId }); updateStatus("⚠️ Send failed mid-chunk"); break; }
-          if (!isLast) await waitUntil(() => !isBotTyping(), 60_000);
-        }
-        updateStatus("✅ Done (chunked)");
-      }
-    }
-
-    _busy = false;
+    await injectToolResult(item, toolName, result, resultText);
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -902,13 +1299,26 @@
         const msgId  = payload.id     ?? null;
         if (!text) return;
         const pushId = msgId || makeTimeId("push");
+        reqResPut({ id: pushId, type: "push", text_preview: text.slice(0, 80), submit, status: "queued" });
         bgLog("push", "📥 Push message received", { id: pushId, preview: text.slice(0, 80), submit });
-        const sent = await typeIntoInput(text, submit);
+
+        const gate = pushInjectGate();
+        let sent = false;
+        if (!gate.allow) {
+          reqResUpdate(pushId, { status: "skipped", skip_reason: gate.reason });
+          bgLog("warn", `⏭️ Push inject skipped: ${gate.reason}`, { id: pushId, reason: gate.reason });
+        } else {
+          setState(SM.INJECTING);
+          sent = await typeIntoInput(text, submit);
+          reqResUpdate(pushId, { status: sent ? "injected" : "error" });
+          setState(sent ? SM.WAITING_AI : SM.IDLE);
+        }
+
         try {
           await fetch(PUSH_ACK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tab: TAB_ID, id: msgId, sent }),
+            body: JSON.stringify({ tab: TAB_ID, id: msgId || pushId, sent }),
           });
         } catch { }
       });
@@ -945,8 +1355,10 @@
 
   let _panel        = null;
   let _logCont      = null;
-  let _bgLogCont    = null;   // background tab content
-  let _toolLogCont  = null;   // tool tab content
+  let _bgLogCont    = null;
+  let _toolLogCont  = null;
+  let _injectLogCont = null;
+  let _traceLogCont  = null;
   let _filter       = "all";
   let _activeTab    = "all";
   let _isFs         = false;
@@ -958,6 +1370,7 @@
     success: { bg:"#1b2b24", border:"#a6e3a1", hBg:"#a6e3a122", c:"#a6e3a1" },
     error:   { bg:"#2a1a1c", border:"#f38ba8", hBg:"#f38ba822", c:"#f38ba8" },
     warn:    { bg:"#2a2310", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
+    skip:    { bg:"#2a2310", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
     info:    { bg:"#1e1e2e", border:"#cba6f7", hBg:"#cba6f722", c:"#cba6f7" },
     user:    { bg:"#1a1a2e", border:"#f9e2af", hBg:"#f9e2af22", c:"#f9e2af" },
     ai:      { bg:"#1a2a1a", border:"#94e2d5", hBg:"#94e2d522", c:"#94e2d5" },
@@ -1009,6 +1422,7 @@
     }
     if (!_bgLogCont) return;
     _appendLogEntry(_bgLogCont, type, title, data);
+    if (["inject", "exec", "queue", "dom"].includes(type)) injectLog(type, title, data);
   }
 
   // Tool tab log — only MCP events
@@ -1016,6 +1430,44 @@
     _ensurePanel();
     if (!_toolLogCont) return;
     _appendLogEntry(_toolLogCont, type, title, data);
+  }
+
+  function injectLog(type, title, data = {}) {
+    _ensurePanel();
+    if (!_injectLogCont) return;
+    _appendLogEntry(_injectLogCont, type, title, data);
+  }
+
+  const TRACE_COLORS = {
+    human:       "#f9e2af",
+    ai_response: "#94e2d5",
+    mcp_req:     "#89b4fa",
+    mcp_res:     "#a6e3a1",
+    push:        "#f2cdcd",
+  };
+
+  function updateTracePanel() {
+    _ensurePanel();
+    if (!_traceLogCont) return;
+    _traceLogCont.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const id of AI_REQ_RES_ORDER) {
+      const e = AI_REQ_RES[id];
+      if (!e) continue;
+      const color = TRACE_COLORS[e.type] || "#cba6f7";
+      const parents = [e.parent_id, e.parent_resp_id, e.parent_req_id].filter(Boolean).join(" ← ");
+      const row = document.createElement("div");
+      row.style.cssText = `padding:6px 8px;border-left:3px solid ${color};background:#11111b55;border-radius:4px;font-size:10px;margin-bottom:4px;`;
+      row.innerHTML = `<div style="color:${color};font-weight:bold;">${e.type} · ${e.status || "?"}</div>
+        <div style="color:#6c7086;font-size:9px;">${id}</div>
+        ${parents ? `<div style="color:#45475a;font-size:9px;">↳ ${parents}</div>` : ""}
+        ${e.op ? `<div style="color:#cdd6f4;">op: ${e.op}</div>` : ""}
+        ${e.skip_reason ? `<div style="color:#f38ba8;">skip: ${e.skip_reason}</div>` : ""}
+        ${e.text_preview ? `<div style="color:#6c7086;margin-top:2px;">${e.text_preview.slice(0, 80)}…</div>` : ""}`;
+      frag.appendChild(row);
+    }
+    _traceLogCont.appendChild(frag);
+    _traceLogCont.scrollTop = _traceLogCont.scrollHeight;
   }
 
   function _appendLogEntry(container, type, title, data) {
@@ -1115,7 +1567,7 @@
         <span style="color:#a6e3a1;font-size:10px;">⬤</span>
         <span style="margin-left:4px;color:#a6adc8;font-size:11px;font-weight:bold;">LuckeyVibes</span>
         <span style="font-size:9px;padding:2px 6px;border-radius:10px;background:#313244;color:#cba6f7;margin-left:4px;">${PLATFORM.name}</span>
-        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v13+</span>
+        <span id="vbc-mcp-badge" style="font-size:9px;padding:2px 6px;border-radius:10px;background:#2a1a3e;color:#89b4fa;margin-left:2px;">v14.1</span>
       </div>
       <div style="display:flex;gap:4px;align-items:center;">
         <button id="vbc-history-btn" title="Tool history" style="background:#313244;color:#cdd6f4;border:none;border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;">📋</button>
@@ -1136,6 +1588,7 @@
       <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
         <span id="vbc-llm-state" style="font-size:9px;padding:1px 5px;border-radius:8px;background:#313244;color:#6c7086;">LLM: unknown</span>
         <span id="vbc-btn-state" style="font-size:9px;padding:1px 5px;border-radius:8px;background:#313244;color:#6c7086;">BTN: unknown</span>
+        <span id="vbc-sm-state" style="font-size:9px;padding:1px 5px;border-radius:8px;background:#313244;color:#a6e3a1;">SM: IDLE</span>
         <span id="vbc-calls">🔧 0 calls</span>
       </div>`;
 
@@ -1162,6 +1615,8 @@
       ["user",       "👤 User"],
       ["ai",         "🤖 AI"],
       ["tool",       "🔧 Tools"],
+      ["inject",     "💉 Inject"],
+      ["trace",      "📊 Trace"],
       ["background", "⚙️ Background"],
     ];
 
@@ -1190,6 +1645,14 @@
     _toolLogCont.id = "vbc-logs-tool";
     _toolLogCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;display:none;";
 
+    _injectLogCont = document.createElement("div");
+    _injectLogCont.id = "vbc-logs-inject";
+    _injectLogCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;display:none;";
+
+    _traceLogCont = document.createElement("div");
+    _traceLogCont.id = "vbc-logs-trace";
+    _traceLogCont.style.cssText = "flex:1;min-height:0;padding:10px;background:#181825;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:4px;box-sizing:border-box;display:none;";
+
     _panel.appendChild(hdr);
     _panel.appendChild(statusBar);
     _panel.appendChild(quickBar);
@@ -1197,6 +1660,8 @@
     _panel.appendChild(_logCont);
     _panel.appendChild(_bgLogCont);
     _panel.appendChild(_toolLogCont);
+    _panel.appendChild(_injectLogCont);
+    _panel.appendChild(_traceLogCont);
     document.body.appendChild(_panel);
 
     _makeDraggable(_panel, hdr);
@@ -1216,10 +1681,13 @@
       });
 
       // Show correct container
-      _logCont.style.display    = ["all","user","ai"].includes(_activeTab) ? "flex" : "none";
-      _toolLogCont.style.display  = _activeTab === "tool"       ? "flex" : "none";
-      _bgLogCont.style.display  = _activeTab === "background"   ? "flex" : "none";
+      _logCont.style.display       = ["all","user","ai"].includes(_activeTab) ? "flex" : "none";
+      _toolLogCont.style.display   = _activeTab === "tool"       ? "flex" : "none";
+      _injectLogCont.style.display = _activeTab === "inject"     ? "flex" : "none";
+      _traceLogCont.style.display  = _activeTab === "trace"      ? "flex" : "none";
+      _bgLogCont.style.display     = _activeTab === "background" ? "flex" : "none";
 
+      if (_activeTab === "trace") updateTracePanel();
       if (_activeTab === "all") _applyFilter("all");
       else if (_activeTab === "user") _applyFilter("user");
       else if (_activeTab === "ai") _applyFilter("ai");
@@ -1241,6 +1709,8 @@
       e.stopPropagation();
       if (_activeTab === "background") _bgLogCont.innerHTML = "";
       else if (_activeTab === "tool") _toolLogCont.innerHTML = "";
+      else if (_activeTab === "inject") _injectLogCont.innerHTML = "";
+      else if (_activeTab === "trace") { for (const k of Object.keys(AI_REQ_RES)) delete AI_REQ_RES[k]; AI_REQ_RES_ORDER.length = 0; updateTracePanel(); }
       else _logCont.innerHTML = "";
     });
 
@@ -1450,8 +1920,8 @@
   }
 
   function _export() {
-    const rows=[];
-    [_logCont, _bgLogCont, _toolLogCont].forEach(cont => {
+    const rows = AI_REQ_RES_ORDER.map(id => ({ source: "AI_REQ_RES", ...AI_REQ_RES[id] }));
+    [_logCont, _bgLogCont, _toolLogCont, _injectLogCont].forEach(cont => {
       if (!cont) return;
       cont.querySelectorAll("[data-lt]").forEach(el => {
         rows.push({
@@ -1472,7 +1942,8 @@
   // 15. BOOT
   // ══════════════════════════════════════════════════════════════════════════
   initPanel();
-  bgLog("info", `🚀 VibesCode v13+ booting`, { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
+  bgLog("info", `🚀 VibesCode v14 booting`, { platform: PLATFORM.name, host: location.hostname, tab: TAB_ID });
+  setState(SM.IDLE);
 
   McpClient.connect();
   connectPushChannel();
@@ -1489,29 +1960,42 @@
     }
   }, 3000);
 
-  // Debounced MutationObserver
-  setTimeout(() => {
-    const root = getChatRoot();
+  // Boot diagnostics + scanner
+  function attachScanner() {
+    const { el, sel } = getScanRoot();
     let SCAN_TIMER = null;
-    new MutationObserver(() => {
+    const mo = new MutationObserver(() => {
       clearTimeout(SCAN_TIMER);
-      SCAN_TIMER = setTimeout(() => {
-        scanUserMessages();
-        scanAiMessages();
-      }, 250);
-    }).observe(root, { childList: true, subtree: true, characterData: true });
-    bgLog("dom", "👁 DOM MutationObserver attached", { rootTag: root.tagName || root.nodeName });
-  }, 800);
+      SCAN_TIMER = setTimeout(() => runScanCycle("mutation"), 250);
+    });
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    if (el !== document.body) {
+      mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+    bgLog("dom", "👁 MutationObserver attached", { root: sel, tag: el.tagName || el.nodeName });
+    log("info", "👁 Scanner ready", { observe: sel, platform: PLATFORM.name });
+    runDomDiagnostics("Boot DOM check");
+    runScanCycle("boot");
+  }
+
+  setTimeout(attachScanner, 800);
+  setTimeout(() => { runDomDiagnostics("Delayed DOM check (2s)"); runScanCycle("delayed"); }, 2000);
+  setTimeout(() => { runDomDiagnostics("Delayed DOM check (5s)"); runScanCycle("delayed"); }, 5000);
+
+  // Poll fallback — catches turns if observer misses (SPA / lazy render)
+  setInterval(() => {
+    if (canScan() && !isBotTyping()) runScanCycle("poll");
+  }, 1500);
 
   // SPA navigation reset
   let _lastPath = location.pathname;
   setInterval(() => {
     if (location.pathname !== _lastPath) {
       _lastPath = location.pathname;
-      _seenTexts.clear();
+      _seenHumanIds.clear();
       bgLog("info", "🔄 SPA navigation detected", { path: location.pathname });
     }
   }, 1_000);
 
-  console.log("[VibesCode v13+] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
+  console.log("[VibesCode v14] Loaded |", PLATFORM.name, "| MCP:", MCP_BASE_URL, "| Tab:", TAB_ID);
 })();

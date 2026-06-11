@@ -75,3 +75,26 @@ Scanner: latest message only — code change in content.js
 Format validator — reject prose + multi-call messages
 Panel timeline filter by trace ID — UX win from IDs you already have
 If you want, I can implement #2 and #3 in content.js next — that’s the highest-impact code change after the prompt swap.
+
+
+
+human:hi
+detect id or fallback to default timestamp id (store this to json dict called (AI_REQ_RES) variables) 
+ai: hello , good morning !
+   * detect id or fallback to default timestamp id (store this to json dict called (AI_REQ_RES) variables)
+   * check mcp call exist or not regex search -  if yes then generate task id(mcp req id )
+   * add to mcp req to queue 
+   * if mcp res then first check this mcp response is of last ai response , if yes and ai in idle then only inject and get response id using dom andd fallback to default id generate and add to AI_REQ_RES variables as human but add type mcp response type
+
+rule:
+only inject mcp response if ai last response releted to this mcp response.
+give some type,some field to AI_REQ_RES(example for every ai response stored add with type is op call )
+give some type of mcp response or some field is mcp , and also if human 
+mcp push message can be injectable but only on idle...
+
+check this Architecture and modify for reliable.
+
+
+
+
+

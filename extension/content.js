@@ -6,8 +6,8 @@
 //  ④ State machine: IDLE→CALL_DETECTED→MCP_EXECUTING→INJECTING→WAITING_AI→IDLE
 //  ⑤ Push inject gate (idle + empty input only)
 //  ⑥ isBotTyping 700ms settle window (Gemini stop-btn flicker)
-//  ⑦ Prose+AGENT_CALL validator — reject mixed messages
-//  ⑧ Parse error → skip turn permanently (WeakMap)
+//  ⑦ Prose+AGENT_CALL validator — AGENT_PATCH blocks allowed for patch
+//  ⑧ AGENT_CALL parse → JSON → repair → field recovery; AGENT_PATCH for edits
 //  ⑨ Trace + Inject panel tabs
 // ════════════════════════════════════════════════════════════════════════════
 (function () {
@@ -244,21 +244,173 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
     return `mcpres-${mcpReqId}_${Date.now()}`;
   }
 
-  /** One-pass JSON prep — normalise path backslashes before parse (not a retry). */
-function preprocessAgentCallJson(jsonPart) {
-  // normalize backslash paths
-  jsonPart = jsonPart.replace(/\\\\/g, "/").replace(/\\(?!["\\/bfnrtu])/g, "/");
+  /** Minimal JSON repair for common LLM mistakes (before strict parse / field recovery). */
+  function repairAgentCallJson(raw) {
+    let s = raw.trim();
+    s = s.replace(/,\s*([}\]])/g, "$1");
+    s = s.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
+    s = s.replace(/\[\s*'([^'\\]*(?:\\.[^'\\]*)*)'\s*\]/g, '["$1"]');
+    s = s.replace(/'\s*,\s*'/g, '", "');
+    return s;
+  }
 
-  // attempt parse — if it works, done
-  try { JSON.parse(jsonPart); return jsonPart; } catch {}
+  /**
+   * Aider/Cline-style patch block — no JSON quoting needed for code edits.
+   * AGENT_PATCH path=src/app.tsx
+   * <<<<<<< SEARCH
+   * old lines
+   * =======
+   * new lines
+   * >>>>>>> REPLACE
+   */
+  function parseAgentPatchBlock(text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("AGENT_PATCH")) return null;
+    const m = trimmed.match(
+      /^AGENT_PATCH\s+path=(\S+)\s*\n<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE\s*$/
+    );
+    if (!m) return null;
+    return {
+      op: "patch",
+      path: m[1],
+      old_str: m[2],
+      new_str: m[3],
+    };
+  }
 
-  // extract op first so we know what fields to expect
-  // rebuild the JSON by extracting known string fields safely
-  const opMatch = jsonPart.match(/"op"\s*:\s*"([^"]+)"/);
-  if (!opMatch) return jsonPart; // can't fix, return as-is
+  /** Normalise Windows path backslashes before JSON.parse. */
+  function preprocessAgentCallJson(jsonPart) {
+    return jsonPart
+      .replace(/\\\\/g, "/")
+      .replace(/\\(?!["\\/bfnrtu])/g, "/");
+  }
 
-  return jsonPart; // fallback
-}
+  const AGENT_CALL_FIELD_ORDER = [
+    "op", "path", "hint", "cwd", "cmd", "pattern", "extensions",
+    "old_str", "new_str", "content", "start_line", "end_line",
+    "staged", "n", "timeout", "action", "name", "tag",
+  ];
+
+  const BOUNDED_STRING_FIELDS = new Set(["old_str", "new_str", "content"]);
+
+  function unescapeJsonFragment(s) {
+    return s
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+
+  function matchSimpleStringField(raw, key) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
+    const m = raw.match(re);
+    return m ? unescapeJsonFragment(m[1]) : undefined;
+  }
+
+  function matchScalarField(raw, key) {
+    const re = new RegExp(`"${key}"\\s*:\\s*(true|false|-?\\d+(?:\\.\\d+)?)`);
+    const m = raw.match(re);
+    if (!m) return undefined;
+    if (m[1] === "true") return true;
+    if (m[1] === "false") return false;
+    const n = Number(m[1]);
+    return Number.isNaN(n) ? undefined : n;
+  }
+
+  /**
+   * Extract string fields that may contain raw (unescaped) double quotes.
+   * Uses the next JSON key position as the end boundary, then strips one structural closing quote.
+   */
+  function extractBoundedStringField(raw, key) {
+    const marker = `"${key}":"`;
+    const keyPos = raw.indexOf(`"${key}"`);
+    if (keyPos < 0) return undefined;
+
+    const start = raw.indexOf(marker, keyPos);
+    if (start < 0) return undefined;
+    const valueStart = start + marker.length;
+
+    let nextKeyPos = raw.length;
+    for (const fk of AGENT_CALL_FIELD_ORDER) {
+      if (fk === key) continue;
+      const fkPos = raw.indexOf(`"${fk}"`, valueStart);
+      if (fkPos >= valueStart && fkPos < nextKeyPos) nextKeyPos = fkPos;
+    }
+
+    let between = raw.slice(valueStart, nextKeyPos);
+    if (between.endsWith('",')) between = between.slice(0, -2);
+    else if (between.endsWith('"}')) between = between.slice(0, -2);
+    else if (between.endsWith('"')) between = between.slice(0, -1);
+    return unescapeJsonFragment(between);
+  }
+
+  /**
+   * Field-boundary recovery when JSON.parse fails (unescaped quotes in old_str/new_str/content).
+   * Uses known key order: reads until next `","<key>":"` delimiter.
+   */
+  function extractAgentCallFields(raw) {
+    const op = matchSimpleStringField(raw, "op");
+    if (!op) return null;
+
+    const result = { op };
+
+    for (const key of ["path", "hint", "cwd", "cmd", "pattern", "extensions", "action", "name", "tag"]) {
+      if (!raw.includes(`"${key}"`)) continue;
+      if (BOUNDED_STRING_FIELDS.has(key)) continue;
+      const v = matchSimpleStringField(raw, key);
+      if (v !== undefined) result[key] = v;
+    }
+
+    for (const key of ["start_line", "end_line", "n", "timeout"]) {
+      const v = matchScalarField(raw, key);
+      if (v !== undefined) result[key] = v;
+    }
+
+    if (raw.includes('"staged"')) {
+      const staged = matchScalarField(raw, "staged");
+      if (staged !== undefined) result.staged = staged;
+    }
+
+    for (const key of BOUNDED_STRING_FIELDS) {
+      if (!raw.includes(`"${key}"`)) continue;
+      const v = extractBoundedStringField(raw, key);
+      if (v !== undefined) result[key] = v;
+    }
+
+    return result;
+  }
+
+  /**
+   * Parse AGENT_CALL JSON — strict JSON first, then field-boundary recovery.
+   * @returns {{ call: object|null, method: 'json'|'recover'|'failed', error?: string }}
+   */
+  function parseAgentCall(jsonPart) {
+    const trimmed = jsonPart.trim();
+    const prepped = preprocessAgentCallJson(trimmed);
+
+    try {
+      return { call: JSON.parse(prepped), method: "json" };
+    } catch (e) {
+      /* fall through */
+    }
+
+    const repaired = repairAgentCallJson(prepped);
+    if (repaired !== prepped) {
+      try {
+        return { call: JSON.parse(repaired), method: "repair" };
+      } catch (e) {
+        /* fall through */
+      }
+    }
+
+    const recovered = extractAgentCallFields(trimmed);
+    if (recovered?.op) {
+      return { call: recovered, method: "recover" };
+    }
+
+    return { call: null, method: "failed", error: "unparseable" };
+  }
 
   function formatToolResultHeader(toolName, mcpReqId, mcpResId) {
     return [
@@ -455,17 +607,16 @@ function preprocessAgentCallJson(jsonPart) {
   }
 
   function validateAgentCallMessage(text) {
+    const patchCall = parseAgentPatchBlock(text);
+    if (patchCall) {
+      return { ok: true, format: "patch_block", call: patchCall };
+    }
+
     const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
     const agentLines = lines.filter(l => l.startsWith("AGENT_CALL"));
     if (!agentLines.length) return { ok: false, reason: "no_call" };
     if (agentLines.length > 1) return { ok: false, reason: "multiple_calls" };
-    const proseLines = lines.filter(l => {
-      if (l.startsWith("AGENT_CALL")) return false;
-      if (/^```/.test(l)) return false;
-      return l.length > 0;
-    });
-    // if (proseLines.length) return { ok: false, reason: "prose_mixed" };
-    return { ok: true, line: agentLines[0] };
+    return { ok: true, format: "json_line", line: agentLines[0] };
   }
 
   function injectGate(mcpResEntry) {
@@ -1131,37 +1282,37 @@ const McpClient = (() => {
       return;
     }
 
-    bgLog("dom", "🔍 AGENT_CALL in latest AI turn", { id: turn.respId, raw: validation.line.slice(0, 120) });
+    bgLog("dom", "🔍 Tool call in latest AI turn", {
+      id: turn.respId,
+      format: validation.format,
+      raw: (validation.line || turn.text).slice(0, 120),
+    });
 
-    const jsonPart = validation.line.replace(/^AGENT_CALL\s*:?\s*/, "");
-    let call;
-    
-    try {
-      call = JSON.parse(preprocessAgentCallJson(jsonPart));
-    } catch (parseErr) {
-      reqResUpdate(turn.respId, { status: "error", skip_reason: "parse_error", has_call: true });
-      _turnState.set(turn.el, { processed: true, status: "parse_error" });
-      bgLog("error", "❌ AGENT_CALL parse error — injecting correction", { id: turn.respId });
+    let call = null;
+    let parseMethod = validation.format;
 
-      const correction = [
-        "__PARSE_ERROR__",
-        "Your last AGENT_CALL could not be parsed as valid JSON.",
-        "Most likely cause: unescaped double quotes inside string values.",
-        "",
-        'Wrong:   "key": "hr"     inside a JSON string value',
-        'Correct: "key": \\"hr\\"   escape inner quotes with \\"',
-        "",
-        "Please reissue the AGENT_CALL with correctly escaped JSON.",
-        "Only the AGENT_CALL line — no explanation.",
-      ].join("\n");
+    if (validation.format === "patch_block") {
+      call = validation.call;
+    } else {
+      const jsonPart = validation.line.replace(/^AGENT_CALL\s*:?\s*/, "");
+      const parsed = parseAgentCall(jsonPart);
+      if (!parsed.call) {
+        reqResUpdate(turn.respId, { status: "error", skip_reason: "parse_error", has_call: true });
+        _turnState.set(turn.el, { processed: true, status: "parse_error" });
+        log("error", "❌ AGENT_CALL unparseable — turn skipped", { id: turn.respId, line: validation.line.slice(0, 200) });
+        bgLog("error", "❌ AGENT_CALL unparseable — turn skipped", { id: turn.respId, line: validation.line.slice(0, 200) });
+        return;
+      }
+      call = parsed.call;
+      parseMethod = parsed.method;
+    }
 
-      // fire and forget — scanAiMessages is not async
-      (async () => {
-        setState(SM.INJECTING);
-        await typeIntoInput(correction, true);
-        setState(SM.WAITING_AI);
-      })();
-      return;
+    if (parseMethod === "recover" || parseMethod === "repair") {
+      log("success", `✅ AGENT_CALL recovered (${call.op}) via ${parseMethod}`, { id: turn.respId, op: call.op });
+      bgLog("success", `✅ AGENT_CALL recovered via ${parseMethod}`, { id: turn.respId, op: call.op, method: parseMethod });
+    } else if (parseMethod === "patch_block") {
+      log("success", `✅ AGENT_PATCH block parsed (${call.path})`, { id: turn.respId, op: "patch" });
+      bgLog("success", "✅ AGENT_PATCH block parsed", { id: turn.respId, path: call.path });
     }
 
     const normalizedCall = normalizeCallPaths(call);

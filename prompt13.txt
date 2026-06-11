@@ -72,6 +72,10 @@ AGENT_CALL {"op":"<name>","key":"value"}
    `{"path":"src/app/lib/hrApi.ts"}`
    For absolute Windows paths: `C:/Users/luckey/Desktop/myapp`
 3. **Strings in JSON** — escape `"` as `\"`, newlines as `\n`, backslashes as `\\`
+   - **Critical for `patch` / `write`:** code inside `old_str`, `new_str`, `content` has many `"` — every one must be `\"` in JSON
+   - Wrong: `"old_str":"    key: "hr","`  → breaks the parser
+   - Right: `"old_str":"    key: \"hr\","`
+   - Prefer small `old_str` snippets (3–8 lines) to reduce escaping mistakes
 4. **TypeScript generics in `write`/`patch` content** — must stay intact:
    `Partial<LeaveType>` not `Partial` — escape `<` `>` inside JSON strings correctly
 5. **Shell `cmd`** — avoid nested double-quotes; use single words or PowerShell

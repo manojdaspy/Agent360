@@ -617,6 +617,88 @@ def write(path: str, content: str) -> str:
     return f"OK: wrote {path} ({len(content)} chars, {lines} lines)"
 
 
+def _normalize_newlines(s: str) -> str:
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _strip_trailing_ws_per_line(s: str) -> str:
+    return "\n".join(line.rstrip() for line in s.split("\n"))
+
+
+def _count_line_block_matches(text: str, old_str: str) -> int:
+    text_lines = _normalize_newlines(text).split("\n")
+    old_lines = _normalize_newlines(old_str).split("\n")
+    if not old_lines or (len(old_lines) == 1 and old_lines[0] == ""):
+        return 0
+    n = len(old_lines)
+    count = 0
+    for i in range(len(text_lines) - n + 1):
+        window = text_lines[i : i + n]
+        if all(window[j].rstrip() == old_lines[j].rstrip() for j in range(n)):
+            count += 1
+    return count
+
+
+def _find_line_block_span(text: str, old_str: str) -> tuple[int, int] | None:
+    """Find byte span of old_str in text using line-by-line match (trailing ws ignored)."""
+    if _count_line_block_matches(text, old_str) != 1:
+        return None
+    text_lines = _normalize_newlines(text).split("\n")
+    old_lines = _normalize_newlines(old_str).split("\n")
+    n = len(old_lines)
+    for i in range(len(text_lines) - n + 1):
+        window = text_lines[i : i + n]
+        if all(window[j].rstrip() == old_lines[j].rstrip() for j in range(n)):
+            prefix = "\n".join(text_lines[:i])
+            if i > 0:
+                prefix += "\n"
+            start = len(prefix)
+            matched = "\n".join(text_lines[i : i + n])
+            return start, start + len(matched)
+    return None
+
+
+def _apply_patch(text: str, old_str: str, new_str: str) -> tuple[str | None, str | None]:
+    """
+    Layered patch matching (Aider-inspired):
+      1. exact substring
+      2. CRLF-normalized
+      3. trailing-whitespace-normalized per line
+      4. line-block match (unique only)
+    Returns (updated_text, method) or (None, error_message).
+    """
+    if old_str in text:
+        count = text.count(old_str)
+        if count == 1:
+            return text.replace(old_str, new_str, 1), "exact"
+        return None, f"ERROR: old_str appears {count} times — make it more specific so it matches exactly once."
+
+    norm_text = _normalize_newlines(text)
+    norm_old = _normalize_newlines(old_str)
+    norm_new = _normalize_newlines(new_str)
+    if norm_old in norm_text:
+        count = norm_text.count(norm_old)
+        if count == 1:
+            return norm_text.replace(norm_old, norm_new, 1), "crlf_normalized"
+        return None, f"ERROR: old_str appears {count} times (after CRLF normalize) — add more context."
+
+    ws_text = _strip_trailing_ws_per_line(norm_text)
+    ws_old = _strip_trailing_ws_per_line(norm_old)
+    ws_new = _strip_trailing_ws_per_line(norm_new)
+    if ws_old in ws_text:
+        count = ws_text.count(ws_old)
+        if count == 1:
+            return ws_text.replace(ws_old, ws_new, 1), "trailing_ws_normalized"
+        return None, f"ERROR: old_str appears {count} times (after ws normalize) — add more context."
+
+    span = _find_line_block_span(norm_text, norm_old)
+    if span:
+        start, end = span
+        return norm_text[:start] + norm_new + norm_text[end:], "line_block"
+
+    return None, None
+
+
 @mcp.tool()
 def patch(path: str, old_str: str, new_str: str) -> str:
     """
@@ -645,15 +727,15 @@ def patch(path: str, old_str: str, new_str: str) -> str:
     if not target.exists():
         return f"ERROR: file not found: {path}"
     text = target.read_text(encoding="utf-8")
-    if old_str not in text:
+    updated, method = _apply_patch(text, old_str, new_str)
+    if updated is None:
+        if method:
+            return method
         snippet = text[:400] + ("…" if len(text) > 400 else "")
         return f"ERROR: old_str not found in {path}.\nFile preview:\n{snippet}"
-    count = text.count(old_str)
-    if count > 1:
-        return f"ERROR: old_str appears {count} times — make it more specific so it matches exactly once."
-    updated = text.replace(old_str, new_str, 1)
     target.write_text(updated, encoding="utf-8")
-    return f"OK: patched {path}"
+    suffix = f" ({method})" if method and method != "exact" else ""
+    return f"OK: patched {path}{suffix}"
 
 
 @mcp.tool()

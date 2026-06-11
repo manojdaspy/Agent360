@@ -12,44 +12,7 @@
     "clipboardWrite"
   ],
   "host_permissions": [
-      "https://chat.openai.com/*",
-      "https://chatgpt.com/*",
-      "https://claude.ai/*",
-      "https://gemini.google.com/*",
-      "https://aistudio.google.com/*",
-      "https://perplexity.ai/*",
-      "https://grok.com/*",
-      "https://x.com/*",
-      "https://copilot.microsoft.com/*",
-      "https://bing.com/*",
-      "https://chat.mistral.ai/*",
-      "https://huggingface.co/*",
-      "https://poe.com/*",
-      "https://character.ai/*",
-      "https://you.com/*",
-      "https://phind.com/*",
-      "https://groq.com/*",
-      "https://together.ai/*",
-      "https://cohere.com/*",
-      "https://coral.cohere.com/*",
-      "https://chat.deepseek.com/*",
-      "https://kimi.moonshot.cn/*",
-      "https://tongyi.aliyun.com/*",
-      "https://yiyan.baidu.com/*",
-      "https://nova.ai/*",
-      "https://writesonic.com/*",
-      "https://jasper.ai/*",
-      "https://chat.forefront.ai/*",
-      "https://inflection.ai/*",
-      "https://pi.ai/*",
-      "https://meta.ai/*",
-      "https://llama.meta.com/*",
-      "https://replicate.com/*",
-      "https://openrouter.ai/*",
-      "https://lmsys.org/*",
-      "https://chat.lmsys.org/*",
-      "https://studentassignment.lyralogics.com/*",
-      "http://localhost:8000/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
@@ -57,45 +20,29 @@
   "content_scripts": [
     {
       "matches": [
-        "https://chat.openai.com/*",
+        "*://*.ai/*",
+        "*://chat.*/*",
+        "*://*.chat.*/*",
         "https://chatgpt.com/*",
-        "https://claude.ai/*",
+        "https://chat.openai.com/*",
         "https://gemini.google.com/*",
         "https://aistudio.google.com/*",
-        "https://perplexity.ai/*",
         "https://grok.com/*",
         "https://x.com/*",
         "https://copilot.microsoft.com/*",
-        "https://bing.com/*",
-        "https://chat.mistral.ai/*",
+        "https://www.bing.com/*",
         "https://huggingface.co/*",
         "https://poe.com/*",
-        "https://character.ai/*",
         "https://you.com/*",
         "https://phind.com/*",
-        "https://groq.com/*",
-        "https://together.ai/*",
-        "https://cohere.com/*",
-        "https://coral.cohere.com/*",
-        "https://chat.deepseek.com/*",
-        "https://kimi.moonshot.cn/*",
-        "https://tongyi.aliyun.com/*",
-        "https://yiyan.baidu.com/*",
-        "https://nova.ai/*",
-        "https://writesonic.com/*",
-        "https://jasper.ai/*",
-        "https://chat.forefront.ai/*",
-        "https://inflection.ai/*",
-        "https://pi.ai/*",
-        "https://meta.ai/*",
-        "https://llama.meta.com/*",
         "https://replicate.com/*",
-        "https://openrouter.ai/*",
         "https://lmsys.org/*",
-        "https://chat.lmsys.org/*"
+        "https://chat.lmsys.org/*",
+        "https://studentassignment.lyralogics.com/*",
+        "http://localhost:8000/*"
       ],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_end"
     }
   ],
   "web_accessible_resources": [
@@ -105,6 +52,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src *"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src *; trusted-types luckeyvibespolicy 'allow-duplicates'"
   }
 }

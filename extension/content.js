@@ -14,6 +14,21 @@
   "use strict";
 
   // ══════════════════════════════════════════════════════════════════════════
+  // TRUSTED TYPES POLICY — unique name to avoid conflict with host pages
+  // ══════════════════════════════════════════════════════════════════════════
+  if (window.trustedTypes && window.trustedTypes.createPolicy) {
+    try {
+      window.trustedTypes.createPolicy("luckeyvibespolicy", {
+        createHTML:      s => s,
+        createScript:    s => s,
+        createScriptURL: s => s,
+      });
+    } catch (e) {
+      // Policy already registered (e.g. extension reloaded in same context)
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 0. CONFIG
   // ══════════════════════════════════════════════════════════════════════════
   // const MCP_BASE_URL   = "https://studentassignment.lyralogics.com";
@@ -129,6 +144,46 @@
         'button[type="submit"]',
       ],
       chatRoot: 'main',
+      sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+    },
+    {
+      name:    "Copilot",
+      match:   h => h.includes("copilot.microsoft.com"),
+      userMsg: '[data-content="user-message"]',
+      aiMsg:   '[data-content="ai-message"] span.font-ligatures-none',
+      input:   'div[contenteditable="true"]',
+      sendBtns: [
+        'button[aria-label="Submit"]:not([disabled])',
+        'button[aria-label="Send"]:not([disabled])',
+        'button[type="submit"]:not([disabled])',
+      ],
+      sendBtnAny: [
+        'button[aria-label="Submit"]',
+        'button[aria-label="Send"]',
+        'button[type="submit"]',
+      ],
+      chatRoot: '[data-content="conversation"]',
+      aiTurn:   '[data-content="ai-message"]',
+      userTurn: '[data-content="user-message"]',
+      aiText:   'span.font-ligatures-none',
+      sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+    },
+    {
+      name:    "DeepSeek",
+      match:   h => h.includes("chat.deepseek.com"),
+      userMsg: '.ds-message._63c77b1 .fbb737a4',
+      aiMsg:   '.ds-markdown.ds-assistant-message-main-content',
+      input:   'textarea._27c9245',
+      sendBtns: [
+        '.bd74640a:not(.ds-button--disabled)',
+      ],
+      sendBtnAny: [
+        '.bd74640a',
+      ],
+      chatRoot: '.ds-virtual-list.ds-virtual-list--printable',
+      aiTurn:   '._4f9bf79',
+      userTurn: '._9663006',
+      aiText:   '.ds-markdown.ds-assistant-message-main-content',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
     },
     {
@@ -797,6 +852,9 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
       $('.stop-button') ||
       $('[aria-label="Stop"]') ||
       $('[data-is-streaming="true"]') ||
+      $('.ds-button--disabled._52c986b.bd74640a') ||
+      $('button[data-testid="stop-button"]') ||
+      $('button[aria-label="Stop responding"]') ||
       $('loading-indicator:not([hidden])') ||
       $('.loading-indicator-container:not([hidden])') ||
       $('.processing-state-visible[aria-busy="true"]')

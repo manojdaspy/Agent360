@@ -23,7 +23,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     fetch(msg.url, {
       method:  msg.method  || "GET",
       headers: msg.headers || {},
-      body:    msg.body    || undefined,
+      body:    msg.body ?? undefined,
     })
       .then(async r => ({
         ok:     r.ok,

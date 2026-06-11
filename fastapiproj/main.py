@@ -1426,4 +1426,6 @@ async def list_tools_endpoint() -> dict:
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="127.0.0.1", port=port, reload=True, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=port, reload=False, log_level="info")
+
+# pyinstaller --onefile --add-data "system_prompt.txt;." --hidden-import="main" main.py

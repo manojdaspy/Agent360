@@ -1,16 +1,60 @@
+<div align="center">
+
 # Loop360
 
 **Turn any AI chat into a live coding agent — connected to your local project via MCP.**
 
-Works with Gemini · ChatGPT · Claude · Perplexity. No IDE required.
+Works with Gemini · ChatGPT · Claude · Perplexity · No IDE required
 
-> Built by [Manoj Das](https://www.linkedin.com/in/manoj-das-python/) · [GitHub](https://github.com/manojdaspy/nextgen)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-green.svg)](extension/)
+
+**[Demo](#demo) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [Contributing](#contributing)**
+
+> Built by [Manoj Das](https://www.linkedin.com/in/manoj-das-python/)
+
+</div>
+
+---
+
+## Demo
+
+> **See it in action — type a task, watch the AI read and edit your real files:**
+
+https://github.com/manojdaspy/nextgen/assets/demo.mp4
+
+> *(Replace the above link with your actual mp4 path after uploading to the repo)*
+
+---
+
+## Screenshots
+
+### Extension Panel — Live agent loop inside ChatGPT
+![Extension panel showing live agent loop](assets/screenshots/panel.png)
+
+### Trace Tab — Every tool call tracked in real time
+![Trace tab showing AGENT_CALL parsing](assets/screenshots/trace.png)
+
+### File Edit — AI patches your real files
+![AI patching a real project file](assets/screenshots/edit.png)
+
+### Status API — Rich extension state
+![/ext/status JSON response](assets/screenshots/status.png)
+
+> **How to add your screenshots:**
+> 1. Create folder `assets/screenshots/` in the repo
+> 2. Take screenshots and save them with the names above
+> 3. Record a demo video, save as `assets/demo.mp4`
+> 4. Push to GitHub — the images will render automatically
 
 ---
 
 ## What is Loop360?
 
-Loop360 is a **browser extension + local MCP server** that gives any AI chat interface direct access to your local filesystem. You type a task in ChatGPT or Gemini, the AI reads and edits your actual project files, runs your tests, and keeps iterating — all inside the chat window you already use.
+Loop360 is a **browser extension + local MCP server** that gives any AI chat interface direct, live access to your local filesystem.
+
+You type a task in ChatGPT or Gemini. The AI reads your actual files, writes code, runs tests, checks git — all from inside the chat window you already use. No IDE. No switching context.
 
 ```
 You type a task in any AI chat
@@ -58,7 +102,7 @@ AI sees the result and continues working
 
 ---
 
-## Installation
+## Quick Start
 
 ### Step 1 — Clone the repository
 
@@ -85,15 +129,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` includes:
-```
-fastapi
-uvicorn
-fastmcp
-anyio
-```
-
-### Step 4 — Configure environment variables (optional but recommended)
+### Step 4 — Configure environment variables
 
 ```bash
 # Windows
@@ -118,6 +154,7 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Verify it is running:
+
 ```bash
 curl http://localhost:8000/health
 ```
@@ -131,38 +168,41 @@ Expected response:
 
 ## Extension Setup
 
-### Step 1 — Load the extension in Chrome
+### Step 1 — Load in Chrome
 
-1. Open Chrome and navigate to `chrome://extensions/`
-2. Toggle **Developer mode** ON (top right corner)
+1. Open Chrome → `chrome://extensions/`
+2. Toggle **Developer mode** ON (top right)
 3. Click **Load unpacked**
-4. Select the `extension/` folder inside the cloned repo
+4. Select the `extension/` folder from the cloned repo
 
-### Step 2 — Point the extension to your server
+### Step 2 — Point to your server
 
-Open `extension/content.js` in any text editor and find:
+Open `extension/content.js` and find:
 
 ```javascript
 const MCP_BASE_URL = "http://localhost:8000";
 ```
 
-Change the port if needed. Save the file, then click **🔄 refresh** on the extension card in `chrome://extensions/`.
+Change the port if needed. Save, then click **🔄 refresh** on the extension card.
 
-### Step 3 — Load the system prompt into the AI
+### Step 3 — Load the system prompt into your AI
 
 The AI needs to know Loop360's tool format. Two options:
 
 **Option A — Paste into custom instructions (recommended):**
 
-Copy the full contents of `system_prompt.txt` and paste into your AI platform's system prompt field:
-- **ChatGPT:** Settings → Personalization → Custom Instructions
-- **Gemini:** Create a Gem → set system instructions
-- **Claude:** Projects → Project Instructions
-- **Perplexity:** Space instructions
+Copy the full contents of `system_prompt.txt` and paste into your AI platform:
+
+| Platform | Where to paste |
+|----------|---------------|
+| ChatGPT | Settings → Personalization → Custom Instructions |
+| Gemini | Create a Gem → set system instructions |
+| Claude | Projects → Project Instructions |
+| Perplexity | Space instructions |
 
 **Option B — Load at runtime:**
 
-Type this in the chat:
+Type this in the chat window:
 ```
 AGENT_CALL {"op":"rules"}
 ```
@@ -175,12 +215,12 @@ The extension fetches and injects the system prompt automatically.
 **Via chat (easiest):**
 > "My project is at C:\Users\me\Desktop\myapp"
 
-The AI will emit:
+The AI emits:
 ```
 AGENT_CALL {"op":"detect_root","hint":"C:/Users/me/Desktop/myapp"}
 ```
 
-**Via extension panel:** Click the 📁 icon and paste the path.
+**Via extension panel:** Click 📁 and paste the path.
 
 **Via API:**
 ```bash
@@ -188,6 +228,36 @@ curl -X POST http://localhost:8000/project/set \
   -H "Content-Type: application/json" \
   -d "{\"path\": \"C:/Users/me/Desktop/myapp\"}"
 ```
+
+---
+
+## How It Works
+
+### The agent loop
+
+Each AI response contains exactly one tool call. The extension detects it, sends it to your local MCP server, injects the result back into the chat, and the AI continues. This loop runs until the task is complete.
+
+### The 4-tier parser
+
+AI models produce inconsistent JSON. Loop360 handles this gracefully:
+
+| Stage | Method |
+|-------|--------|
+| 1 | Path normalize — backslashes → forward slashes |
+| 2 | `JSON.parse` — AI emitted valid JSON |
+| 3 | JSON repair — trailing commas, single→double quotes |
+| 4 | Field-boundary recovery — unescaped quotes in strings |
+
+If all stages fail, the turn is skipped and logged as `parse_error` in the Trace tab.
+
+### LLM state machine
+
+| State | Meaning |
+|-------|---------|
+| `generating` | AI is streaming a response |
+| `idle` | AI finished, input empty |
+| `injectable` | Safe to inject a new message |
+| `injecting` | Extension is typing and sending |
 
 ---
 
@@ -202,7 +272,7 @@ curl -X POST http://localhost:8000/project/set \
 **Run tests:**
 > "Run the test suite and fix any failures"
 
-**Check git status:**
+**Check git:**
 > "Show me what changed since the last commit"
 
 **Push a task from CI:**
@@ -221,7 +291,7 @@ curl -X POST http://localhost:8000/push/send \
 |------|-------------|
 | `rules` | Load the system prompt from the server |
 | `tree` / `dir_list` | Directory listing |
-| `cat` / `cat_range` | Read files (full or by line range) |
+| `cat` / `cat_range` | Read files — full or by line range |
 | `search` | Search files by keyword |
 | `write` | Write or overwrite a file |
 | `patch` | Aider-style SEARCH/REPLACE edit |
@@ -249,7 +319,7 @@ curl -X POST http://localhost:8000/push/send \
 | POST | `/project/set` | Set project root |
 | POST | `/project/detect` | Auto-detect root from hint path |
 | GET | `/tools` | List all MCP tools as JSON |
-| GET | `/docs` | Swagger UI (interactive API docs) |
+| GET | `/docs` | Swagger UI — interactive API docs |
 | GET | `/mcp/sse` | MCP SSE handshake |
 | POST | `/mcp/messages` | MCP JSON-RPC tool calls |
 
@@ -267,6 +337,9 @@ nextgen/
 ├── architecture.md           ← Architecture and design notes
 ├── requirements.txt
 ├── .gitignore
+├── assets/
+│   ├── demo.mp4              ← Demo video
+│   └── screenshots/          ← Screenshot images
 └── extension/
     ├── manifest.json         ← Chrome extension manifest
     ├── content.js            ← MCP client + parser + panel UI
@@ -284,7 +357,7 @@ nextgen/
 | Claude | ✅ |
 | Perplexity | ✅ |
 
-> DOM selectors break when AI platforms update their UI. If a platform stops working, check the extension panel (All tab → 🩺 DOM Diagnostics) and open an issue.
+> DOM selectors break when AI platforms update their UI. If a platform stops working, open the extension panel → All tab → check 🩺 DOM Diagnostics, then open an issue.
 
 ---
 
@@ -295,21 +368,21 @@ nextgen/
 | Server not responding | `curl http://localhost:8000/health` — check terminal for errors |
 | Extension not detecting turns | Panel → All tab → check 🩺 DOM Diagnostics |
 | Tool result not injecting | Verify `llm_state: injectable` via `/ext/status` |
-| Parse error on tool call | Extension auto-recovers most cases — check Trace tab for details |
-| Platform selector broken | Open an issue with the platform name and Chrome version |
+| Parse error on tool call | Check Trace tab — extension auto-recovers most cases |
+| Platform selector broken | Open an issue with platform name and Chrome version |
 
 ---
 
-## Security
+## ⚠️ Security
 
 - The `shell` tool has **no command allowlist** — the AI can run any command on your machine
 - Always set `VIBESCODE_SECRET` if the server is accessible beyond `127.0.0.1`
-- Never run with `--host 0.0.0.0` on a public network without authentication
+- Never run with `--host 0.0.0.0` on a public or shared network without authentication
 - Tool results are capped at ~6000 chars — use `cat_range` for large files
 
 ---
 
-## Terms of Service Notice
+## ⚠️ Terms of Service Notice
 
 This tool automates interactions with third-party AI chat platforms. Users are solely responsible for ensuring their usage complies with the Terms of Service of ChatGPT, Gemini, Claude, Perplexity, or any other platform they connect to. The authors take no responsibility for account suspensions or violations.
 
@@ -317,14 +390,14 @@ This tool automates interactions with third-party AI chat platforms. Users are s
 
 ## Contributing
 
-The number one way to contribute is fixing DOM selectors — AI platforms update their UI constantly and selectors break without notice.
+The number one way to contribute is **fixing DOM selectors** — AI platforms update their UI constantly and selectors break without notice.
 
 ### Steps
 
 1. Fork the repository
 2. Create a branch: `git checkout -b fix/chatgpt-selector`
 3. Make your changes
-4. Commit with a clear message: `git commit -m "fix: update ChatGPT turn selector after UI update"`
+4. Commit: `git commit -m "fix: update ChatGPT turn selector after UI update"`
 5. Push: `git push origin fix/chatgpt-selector`
 6. Open a Pull Request describing what broke and what you changed
 
@@ -336,7 +409,7 @@ The number one way to contribute is fixing DOM selectors — AI platforms update
 - Documentation improvements
 - Security hardening for the `shell` tool
 
-Please open an issue before starting large changes so we can align first.
+Please open an issue before starting large changes.
 
 ---
 
@@ -354,4 +427,8 @@ MIT License — free to use, modify, and distribute. See [LICENSE](LICENSE) for 
 
 ---
 
+<div align="center">
+
 *If Loop360 saved you time, a ⭐ on GitHub helps others find it.*
+
+</div>

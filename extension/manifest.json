@@ -12,7 +12,17 @@
     "clipboardWrite"
   ],
   "host_permissions": [
-    "<all_urls>"
+      "https://chatgpt.com/*",
+      "https://claude.ai/*",
+      "https://chat.openai.com/*",
+      "https://chat.deepseek.com/*",
+      "https://gemini.google.com/*",
+      "https://aistudio.google.com/*",
+      "https://grok.com/*",
+      "https://x.com/*",
+      "https://copilot.microsoft.com/*",
+      "https://www.bing.com/*",
+      "http://localhost:8000/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -20,24 +30,15 @@
   "content_scripts": [
     {
       "matches": [
-          "*://*.ai/*",
           "https://chatgpt.com/*",
+          "https://claude.ai/*",
           "https://chat.openai.com/*",
           "https://chat.deepseek.com/*",
           "https://gemini.google.com/*",
           "https://aistudio.google.com/*",
           "https://grok.com/*",
-          "https://x.com/*",
           "https://copilot.microsoft.com/*",
           "https://www.bing.com/*",
-          "https://huggingface.co/*",
-          "https://poe.com/*",
-          "https://you.com/*",
-          "https://phind.com/*",
-          "https://replicate.com/*",
-          "https://lmsys.org/*",
-          "https://chat.lmsys.org/*",
-          "https://studentassignment.lyralogics.com/*",
           "http://localhost:8000/*"
       ],
       "js": ["content.js"],

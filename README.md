@@ -98,6 +98,7 @@ AI sees the result and continues working
 
 - Python 3.9+
 - Google Chrome (or any Chromium browser)
+- Microsoft Edge
 - Git
 
 ---

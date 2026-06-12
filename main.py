@@ -325,7 +325,7 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
 @mcp.tool()
 def set_root(path: str) -> str:
     """
-    Set the project root dynamically to any absolute path on any drive.
+    Manually set the project root to an absolute path.Parameters: `path` (string). Call: `AGENT_CALL {"op":"set_root","path":"D:/work/myapp"}`
 
     Accepts Windows paths with single or double backslashes, forward slashes,
     and Unix paths. All path separators are normalised automatically.
@@ -350,7 +350,8 @@ def set_root(path: str) -> str:
 @mcp.tool()
 def detect_root(hint: str) -> str:
     """
-    Auto-detect project root from any file or folder path inside the project.
+    Finds project root by walking up from a hint path.Parameters: `hint` (string)  any file or folder path inside the project. Call: `AGENT_CALL {"op":"detect_root","hint":"C:/Users/user/project/src/index.js"}`
+
 
     Accepts Windows paths (backslashes, double-backslashes) or Unix paths.
     All separators are normalised before use.
@@ -400,6 +401,7 @@ import inspect
 @mcp.tool()
 async def list_mcp_tools() -> str:
     """
+    List all available tools with descriptions. Call: AGENT_CALL {"op":"list_mcp_tools"}
     List every tool currently registered on this MCP server.
 
     Returns the tool name and first line of its description.
@@ -436,7 +438,7 @@ async def list_mcp_tools() -> str:
 @mcp.tool()
 def tree(path: str = ".") -> str:
     """
-    Recursive directory tree starting at the given path.
+    Recursive directory listing (skips `.git`, `node_modules`, etc.). Parameters: `path` (optional, defaults to project root).Call: `AGENT_CALL {"op":"tree"}` Example: `AGENT_CALL {"op":"tree","path":"src"}`
 
     Skips common noise directories: .git, node_modules, __pycache__, .venv,
     dist, build, .next, .turbo, coverage, .cache, out, .nuxt, .svelte-kit.
@@ -467,7 +469,7 @@ def tree(path: str = ".") -> str:
 @mcp.tool()
 def dir_list(path: str = ".") -> str:
     """
-    List the immediate (non-recursive) contents of a directory.
+    List immediate contents of a directory.Parameters: `path` (optional). Call: `AGENT_CALL {"op":"dir_list"}`
 
     path: absolute path (any drive, backslashes or forward slashes) or
           relative to project root. Defaults to the project root.
@@ -488,7 +490,7 @@ def dir_list(path: str = ".") -> str:
 @mcp.tool()
 def cat(path: str) -> str:
     """
-    Read the full contents of a file and return them as plain text.
+    Read the full content of a file.Parameters: `path` (string). Call: `AGENT_CALL {"op":"cat","path":"index.html"}`
 
     path: absolute path (any drive, backslashes or forward slashes accepted)
           or relative to project root.
@@ -517,7 +519,7 @@ def cat(path: str) -> str:
 @mcp.tool()
 def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
     """
-    Read a specific range of lines from a file (1-based, inclusive).
+    Read a specific range of lines (1-based). Parameters: `path`, `start_line`, `end_line`. Call: `AGENT_CALL {"op":"cat_range","path":"src/app.py","start_line":10,"end_line":30}`
 
     path: absolute path (any drive) or relative to project root.
     start_line: first line to return (1-based, default 1).
@@ -546,7 +548,8 @@ def cat_range(path: str, start_line: int = 1, end_line: int = 100) -> str:
 @mcp.tool()
 def search(pattern: str, path: str = ".", extensions: str = "") -> str:
     """
-    Search files for a regex pattern and return matching lines with locations.
+    Search files for a regex pattern. Parameters: `pattern`, `path` (optional, defaults to root), `extensions` (comma‑separated, optional).Call: `AGENT_CALL {"op":"search","pattern":"TODO","extensions":".py,.js"}`
+
 
     pattern:    Python regular expression (case-insensitive).
     path:       Root directory to search (absolute or relative to project root).
@@ -596,7 +599,7 @@ def search(pattern: str, path: str = ".", extensions: str = "") -> str:
 @mcp.tool()
 def write(path: str, content: str) -> str:
     """
-    Create a new file or completely overwrite an existing one.
+    Create a new file or completely overwrite an existing one.Create or overwrite a file with new content.Parameters: `path`, `content`. Call: `AGENT_CALL {"op":"write","path":"newfile.txt","content":"Hello world"}` ⚠️ Prefer `patch` for changes to existing files.
 
     path:    Absolute path (any drive, backslashes or forward slashes) or
              relative to project root.
@@ -702,7 +705,15 @@ def _apply_patch(text: str, old_str: str, new_str: str) -> tuple[str | None, str
 @mcp.tool()
 def patch(path: str, old_str: str, new_str: str) -> str:
     """
-    Perform a precise, atomic find-and-replace edit inside a file.
+    Precise find-and-replace in a file. `old_str` must appear exactly once.Parameters: `path`, `old_str`, `new_str`. Call: `AGENT_CALL {"op":"patch","path":"index.html","old_str":"<title>Old</title>","new_str":"<title>New</title>"}`
+    
+    **Alternative patch block (no JSON escaping)** - use this format for multi-line edits:
+
+    AGENT_PATCH path=index.html
+    --- old
+    <title>Old</title> 
+    --- new <title>New</title> 
+    --- end
 
     path:    Absolute path or relative to project root.
     old_str: The exact string to locate in the file. Must appear EXACTLY ONCE.
@@ -741,6 +752,8 @@ def patch(path: str, old_str: str, new_str: str) -> str:
 @mcp.tool()
 def mkdir(path: str) -> str:
     """
+    Create a directory (and parent directories).Parameters: path. Call: AGENT_CALL {"op":"mkdir","path":"src/components"}
+
     Create a directory and all its parent directories (equivalent to mkdir -p).
 
     path: Absolute path (any drive) or relative to project root.
@@ -758,6 +771,7 @@ def mkdir(path: str) -> str:
 @mcp.tool()
 def delete(path: str) -> str:
     """
+    Delete a single file (not a directory).Parameters: path.Call: AGENT_CALL {"op":"delete","path":"temp.txt"}
     Delete a single file permanently.
 
     path: Absolute path or relative to project root.
@@ -783,6 +797,7 @@ def delete(path: str) -> str:
 @mcp.tool()
 def shell(cmd: str, cwd: str = "", timeout: int = 120) -> str:
     """
+    Execute any shell command. Returns stdout+stderr.Parameters: cmd, cwd (optional), timeout (seconds, default 120).Call: AGENT_CALL {"op":"shell","cmd":"npm install"}.Example with cwd: AGENT_CALL {"op":"shell","cmd":"pytest","cwd":"tests"}
     Execute any shell command and return the combined stdout + stderr output.
 
     cmd:     Any shell command string — supports pipes, redirection, &&, ||, etc.
@@ -824,6 +839,8 @@ def shell(cmd: str, cwd: str = "", timeout: int = 120) -> str:
 @mcp.tool()
 def run_tests(cmd: str = "", path: str = ".") -> str:
     """
+    Auto-detect test framework and run tests. Parameters: cmd (optional, overrides auto-detection), path (for Python). Call: AGENT_CALL {"op":"run_tests"} Example: AGENT_CALL {"op":"run_tests","cmd":"npm run test:unit"}
+
     Run the project test suite with auto-detection of the test framework.
 
     cmd:  Custom test command. If empty, the tool detects the right command:
@@ -861,6 +878,8 @@ def run_tests(cmd: str = "", path: str = ".") -> str:
 @mcp.tool()
 def lint(cmd: str = "", path: str = ".") -> str:
     """
+    Auto-detect linter and run it. Parameters: cmd (optional), path. Call: AGENT_CALL {"op":"lint"}
+
     Run the project linter with auto-detection of the linting tool.
 
     cmd:  Custom lint command. If empty, the tool detects the right command:
@@ -894,8 +913,9 @@ def lint(cmd: str = "", path: str = ".") -> str:
 @mcp.tool()
 def git_status() -> str:
     """
-    Show the current git working tree status in short format with branch name.
+    Show working tree status (short format).Call: AGENT_CALL {"op":"git_status"}
 
+    Show the current git working tree status in short format with branch name.
     Equivalent to: git status --short --branch
     Returns the branch, staged changes (A/M/D), and unstaged changes (M/D/?).
     No parameters required.
@@ -906,8 +926,9 @@ def git_status() -> str:
 @mcp.tool()
 def git_diff(path: str = "", staged: bool = False) -> str:
     """
-    Show the diff of working tree changes (or staged changes).
+    Show changes. staged = true for staged changes; path to filter. Call: AGENT_CALL {"op":"git_diff"} Example: AGENT_CALL {"op":"git_diff","staged":true,"path":"src/"}
 
+    Show the diff of working tree changes (or staged changes).
     path:   Optional file or directory to scope the diff to.
             Leave empty to diff the entire repository.
     staged: Set to true to show staged (--cached) changes instead of
@@ -927,8 +948,9 @@ def git_diff(path: str = "", staged: bool = False) -> str:
 @mcp.tool()
 def git_log(n: int = 10, path: str = "") -> str:
     """
-    Show recent git commit history in compact one-line format.
+    Show recent commits. n = number of commits (default 10), path to filter. Call: AGENT_CALL {"op":"git_log","n":20}
 
+    Show recent git commit history in compact one-line format.
     n:    Number of commits to show. Default 10.
     path: Optional file or directory to scope the log to.
           Leave empty to show the full project history.
@@ -951,7 +973,7 @@ def git_log(n: int = 10, path: str = "") -> str:
 @mcp.tool()
 def get_root() -> str:
     """
-    Return the current project root path as a string.
+    Returns the current project root directory.  Call: `AGENT_CALL {"op":"get_root"}`
 
     No parameters required.
     Call this at the very start of every session to confirm where you are
@@ -963,7 +985,7 @@ def get_root() -> str:
 @mcp.tool()
 def project_info() -> str:
     """
-    Detect the project type and summarise the workspace at a glance.
+    Detects the project type (Node, Python, Rust, etc.) and file statistics. Call: `AGENT_CALL {"op":"project_info"}`
 
     Checks the project root for framework/language marker files
     (package.json, pyproject.toml, Cargo.toml, go.mod, manage.py, etc.)
@@ -1015,6 +1037,8 @@ def project_info() -> str:
 @mcp.tool()
 def rules() -> str:
     """
+    Reload this system prompt.Call: AGENT_CALL {"op":"rules"}
+
     Return the VibesCode Agent system prompt / rules.
     
     Call this at the start of every session to load the full agent rules,
@@ -1040,8 +1064,9 @@ def template_prompt(
     tag: str = "",
 ) -> str:
     """
-    Store, retrieve, list, and delete reusable prompt templates and task plans.
+    Store, retrieve, list, or delete persistent templates/plans.Parameter: action = save|get|list|delete.Example save: AGENT_CALL {"op":"template_prompt","action":"save","name":"feature-plan","tag":"plan","content":"Steps: 1. ..."} Example get: AGENT_CALL {"op":"template_prompt","action":"get","name":"feature-plan"}
 
+    Store, retrieve, list, and delete reusable prompt templates and task plans.
     Templates are persisted to disk (vibescode_templates.json next to main.py)
     so they survive server restarts and are shared across all sessions.
 

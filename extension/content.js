@@ -334,30 +334,43 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
     return s;
   }
 
-  /**
-   * Aider/Cline-style patch block — no JSON quoting needed for code edits.
-   * AGENT_PATCH path=src/app.tsx
-   * <<<<<<< SEARCH
-   * old lines
-   * =======
-   * new lines
-   * >>>>>>> REPLACE
-   */
-  function parseAgentPatchBlock(text) {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith("AGENT_PATCH")) return null;
-    const m = trimmed.match(
-      /^AGENT_PATCH\s+path=(\S+)\s*\n<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE\s*$/
-    );
-    if (!m) return null;
+
+function parseAgentPatchBlock(text) {
+  // 1. Try the new simplified format: AGENT_PATCH path=file.txt\n--- old\n...\n--- new\n...\n--- end
+  let m = text.match(/AGENT_PATCH\s+path=(\S+)\s*\n--- old\s*\n([\s\S]*?)\n--- new\s*\n([\s\S]*?)\n--- end/);
+  if (m) {
     return {
       op: "patch",
-      path: m[1],
-      old_str: m[2],
-      new_str: m[3],
+      path: m[1].trim(),
+      old_str: m[2].replace(/\r\n/g, "\n"),
+      new_str: m[3].replace(/\r\n/g, "\n"),
     };
   }
 
+  // 2. Try the function‑call variant: AGENT_PATCH('path'='index.html')\n<<<\n...\n>>>\n...
+  m = text.match(/AGENT_PATCH\s*\(\s*['"]path['"]\s*=\s*['"](\S+)['"]\s*\)\s*\n<<<\s*\n([\s\S]*?)\n>>>\s*\n([\s\S]*?)(?=\n\S|$)/);
+  if (m) {
+    return {
+      op: "patch",
+      path: m[1].trim(),
+      old_str: m[2].replace(/\r\n/g, "\n"),
+      new_str: m[3].replace(/\r\n/g, "\n"),
+    };
+  }
+
+  // 3. Fallback to the original Aider format (strict newlines)
+  m = text.match(/AGENT_PATCH\s+path=(\S+)\s*\r?\n<<<<<<< SEARCH\s*\r?\n([\s\S]*?)\r?\n=======\s*\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE/);
+  if (m) {
+    return {
+      op: "patch",
+      path: m[1].trim(),
+      old_str: m[2].replace(/\r\n/g, "\n"),
+      new_str: m[3].replace(/\r\n/g, "\n"),
+    };
+  }
+
+  return null;
+}
   /** Normalise Windows path backslashes before JSON.parse. */
   function preprocessAgentCallJson(jsonPart) {
     return jsonPart

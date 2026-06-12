@@ -71,6 +71,11 @@
       userTurn: 'section[data-turn="user"]',
       aiText:   '.markdown',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+      typingSelectors: [
+        'button[aria-label="Stop generating"]',
+        'button[data-testid="stop-button"]',
+        '[data-testid="stop-button"]',
+      ],
     },
     {
       name:    "Claude",
@@ -95,6 +100,10 @@
       userTurn: '[data-testid="user-message"]',
       aiText:   '.standard-markdown, .font-claude-response-body',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+      typingSelectors: [
+        '[data-is-streaming="true"]',
+        'button[aria-label="Stop response"]',
+      ],
     },
     {
       name:    "Gemini",
@@ -127,6 +136,11 @@
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: false },
         { key: "Enter", code: "Enter", keyCode: 13, ctrlKey: true },
       ],
+      typingSelectors: [
+        '.stop-button',
+        '[aria-label="Stop"]',
+        'loading-indicator:not([hidden])',
+      ],
     },
     {
       name:    "Perplexity",
@@ -145,6 +159,10 @@
       ],
       chatRoot: 'main',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+      typingSelectors: [
+        'button[aria-label="Stop responding"]',
+        '.stop-button',
+      ],
     },
     {
       name:    "Copilot",
@@ -167,6 +185,10 @@
       userTurn: '[data-content="user-message"]',
       aiText:   'span.font-ligatures-none',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+      typingSelectors: [
+        '.processing-state-visible[aria-busy="true"]',
+        '.loading-indicator-container:not([hidden])',
+      ],
     },
     {
       name:    "DeepSeek",
@@ -175,16 +197,19 @@
       aiMsg:   '.ds-markdown.ds-assistant-message-main-content',
       input:   'textarea._27c9245',
       sendBtns: [
-        '.bd74640a:not(.ds-button--disabled)',
+        '[role="button"]._52c986b:not(.ds-button--disabled):has(path[d^="M8.3125"])',
       ],
       sendBtnAny: [
-        '.bd74640a',
+        '[role="button"]._52c986b:has(path[d^="M8.3125"])',
       ],
       chatRoot: '.ds-virtual-list.ds-virtual-list--printable',
       aiTurn:   '._4f9bf79',
       userTurn: '._9663006',
       aiText:   '.ds-markdown.ds-assistant-message-main-content',
       sendKeys: [{ key: "Enter", code: "Enter", keyCode: 13 }],
+      typingSelectors: [
+        '[role="button"]._52c986b:not(.ds-button--disabled) path[d^="M2 4.88"]',
+      ],
     },
     {
       name:    "Generic",
@@ -583,6 +608,17 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
       return out;
     }
 
+    if (PLATFORM.name === "DeepSeek" && PLATFORM.userTurn) {
+      for (const container of $$(PLATFORM.userTurn, document)) {
+        const textEl = $(PLATFORM.userMsg.split(" ").slice(1).join(" "), container) || container;
+        const text = (textEl.innerText || "").trim();
+        if (!text.length) continue;
+        const domId = getDomId(container, "human");
+        out.push({ el: textEl, container, domId, humanId: `human-${domId}`, text });
+      }
+      return out;
+    }
+
     for (const el of $$(PLATFORM.userMsg, document)) {
       const text = (el.innerText || "").trim();
       if (!text.length) continue;
@@ -631,6 +667,17 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
         const text = (textEl.innerText || "").trim();
         if (text.length < 2) continue;
         seen.add(block);
+        const domId = getDomId(block, "turn");
+        out.push({ el: block, container: block, domId, respId: `resp-${domId}`, text, textEl });
+      }
+      return out;
+    }
+
+    if (PLATFORM.name === "DeepSeek" && PLATFORM.aiTurn) {
+      for (const block of $$(PLATFORM.aiTurn, document)) {
+        const textEl = $(PLATFORM.aiText, block) || block;
+        const text = (textEl.innerText || "").trim();
+        if (text.length < 2) continue;
         const domId = getDomId(block, "turn");
         out.push({ el: block, container: block, domId, respId: `resp-${domId}`, text, textEl });
       }
@@ -844,7 +891,15 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
   let _lastTypingAt = 0;
   let _wasTyping    = false;
 
-  function isBotTypingRaw() {
+function isBotTypingRaw() {
+    // Platform-specific checks first — exact, fast, authoritative when present.
+    if (PLATFORM.typingSelectors) {
+      for (const sel of PLATFORM.typingSelectors) {
+        if ($(sel)) return true;
+      }
+    }
+
+    // Generic fallback — covers platforms without typingSelectors.
     return !!(
       $('button[aria-label="Stop response"]') ||
       $('button[aria-label="Stop generating"]') ||
@@ -852,7 +907,6 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
       $('.stop-button') ||
       $('[aria-label="Stop"]') ||
       $('[data-is-streaming="true"]') ||
-      $('.ds-button--disabled._52c986b.bd74640a') ||
       $('button[data-testid="stop-button"]') ||
       $('button[aria-label="Stop responding"]') ||
       $('loading-indicator:not([hidden])') ||
@@ -887,8 +941,7 @@ function bgSSE(url, { eventNames = ["message"], onOpen, onError, onEvent } = {})
     if (isBotTyping()) return "generating";
     const btnStatus = getSendButtonStatus();
     const empty = isInputEmpty();
-    if (empty && btnStatus === "disabled") return "idle";
-    if (empty && btnStatus === "active") return "injectable";
+    if (empty) return "injectable";
     if (!empty) return "idle";
     return "idle";
   };

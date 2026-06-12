@@ -4,7 +4,7 @@
 
 **Turn any AI chat into a live coding agent — connected to your local project via MCP.**
 
-Works with Gemini · ChatGPT · Claude · Perplexity · No IDE required
+Works with Gemini · ChatGPT · Claude · DeepSeek · No IDE required
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)

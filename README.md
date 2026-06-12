@@ -1,6 +1,6 @@
 <div align="center">
 
-# Loop360
+# Agent360
 
 **Turn any AI chat into a live coding agent — connected to your local project via MCP.**
 
@@ -22,7 +22,7 @@ Works with Gemini · ChatGPT · Claude · Perplexity · No IDE required
 
 > **See it in action — type a task, watch the AI read and edit your real files:**
 
-https://github.com/manojdaspy/nextgen/assets/demo.mp4
+https://github.com/manojdaspy/Agent360/assets/demo.mp4
 
 > *(Replace the above link with your actual mp4 path after uploading to the repo)*
 
@@ -50,9 +50,9 @@ https://github.com/manojdaspy/nextgen/assets/demo.mp4
 
 ---
 
-## What is Loop360?
+## What is Agent360?
 
-Loop360 is a **browser extension + local MCP server** that gives any AI chat interface direct, live access to your local filesystem.
+Agent360 is a **browser extension + local MCP server** that gives any AI chat interface direct, live access to your local filesystem.
 
 You type a task in ChatGPT or Gemini. The AI reads your actual files, writes code, runs tests, checks git — all from inside the chat window you already use. No IDE. No switching context.
 
@@ -107,8 +107,8 @@ AI sees the result and continues working
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/manojdaspy/nextgen.git
-cd nextgen
+git clone https://github.com/manojdaspy/Agent360.git
+cd Agent360
 ```
 
 ### Step 2 — Create a virtual environment
@@ -187,7 +187,7 @@ Change the port if needed. Save, then click **🔄 refresh** on the extension ca
 
 ### Step 3 — Load the system prompt into your AI
 
-The AI needs to know Loop360's tool format. Two options:
+The AI needs to know Agent360's tool format. Two options:
 
 **Option A — Paste into custom instructions (recommended):**
 
@@ -239,7 +239,7 @@ Each AI response contains exactly one tool call. The extension detects it, sends
 
 ### The 4-tier parser
 
-AI models produce inconsistent JSON. Loop360 handles this gracefully:
+AI models produce inconsistent JSON. Agent360 handles this gracefully:
 
 | Stage | Method |
 |-------|--------|
@@ -328,7 +328,7 @@ curl -X POST http://localhost:8000/push/send \
 ## Project Structure
 
 ```
-nextgen/
+Agent360/
 ├── main.py                   ← FastAPI + MCP server (all tools)
 ├── system_prompt.txt         ← Official AI system prompt
 ├── system_prompt_new.txt     ← Updated prompt (in progress)
@@ -429,6 +429,6 @@ MIT License — free to use, modify, and distribute. See [LICENSE](LICENSE) for 
 
 <div align="center">
 
-*If Loop360 saved you time, a ⭐ on GitHub helps others find it.*
+*If Agent360 saved you time, a ⭐ on GitHub helps others find it.*
 
 </div>
